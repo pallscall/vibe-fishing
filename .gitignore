@@ -5,3 +5,7 @@ node_modules/
 ./backend/storage
 ./frontend/.next
 ./frontend/.env
+
+
+./backend/node_modules
+./frontend/node_modules
