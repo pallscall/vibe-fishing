@@ -1,0 +1,7 @@
+node_modules/
+
+./backend/.env
+./backend/config.yaml
+./backend/storage
+./frontend/.next
+./frontend/.env

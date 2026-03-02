@@ -1,0 +1,33 @@
+chat:
+  requestTimeoutMs: 600000
+  streamIdleTimeoutMs: 120000
+  contextMaxMessages: 12
+  summaryEnabled: true
+  summaryTriggerMessages: 24
+  summaryKeepMessages: 8
+  thinkingSummaryEnabled: false
+  autoSkillEnabled: true
+  mcpEnabled: true
+
+models:
+  - id: gpt-4o
+    name: GPT-4o
+    provider: OpenAI
+    protocol: openai
+    model: gpt-4o
+    baseUrl: https://api.openai.com/v1
+    apiKey: REPLACE_WITH_API_KEY
+  - id: claude-3-5-sonnet
+    name: Claude 3.5 Sonnet
+    provider: Anthropic
+    protocol: anthropic
+    model: claude-3-5-sonnet
+    baseUrl: https://api.anthropic.com/v1
+    apiKey: REPLACE_WITH_API_KEY
+  - id: openai-compatible
+    name: OpenAI Compatible
+    provider: Custom
+    protocol: openai
+    model: your-model-id
+    baseUrl: https://example.com/v1
+    apiKey: REPLACE_WITH_API_KEY
