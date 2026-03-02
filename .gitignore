@@ -1,11 +1,9 @@
 node_modules/
 
-./backend/.env
-./backend/config.yaml
-./backend/storage
-./frontend/.next
-./frontend/.env
+.env
+config.yaml
 
 
-./backend/node_modules
-./frontend/node_modules
+.next/
+frontend/.next/
+backend/storage/
