@@ -21,6 +21,8 @@ import { saveFileArtifact, saveTextArtifact } from '../store/artifacts'
 import { getSkillByName, loadSkills, resolveSkillsPath, type SkillDefinition } from '../skills/loader'
 import { executeMcpTool, loadMcpToolset, type OpenAiToolDefinition } from '../mcp/tools'
 import type { McpServerConfig } from '../mcp/config'
+import { BUILTIN_TOOL_DEFINITIONS } from '../tools/builtin/definitions'
+import { runTavilyWebSearch } from '../tools/builtin/webSearch'
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -63,6 +65,47 @@ const parseContextMaxMessages = () => {
   const raw = process.env.CHAT_CONTEXT_MAX_MESSAGES ?? process.env.CONTEXT_MAX_MESSAGES
   const parsed = raw ? Number.parseInt(raw, 10) : 20
   if (!Number.isFinite(parsed) || parsed <= 0) return 20
+  return parsed
+}
+
+const parseContextTokenThreshold = () => {
+  const fromConfig = (loadAppConfig() as any)?.chat?.contextTokenThreshold
+  if (typeof fromConfig === 'number' && Number.isFinite(fromConfig) && fromConfig > 0) {
+    return fromConfig
+  }
+  const raw = process.env.CHAT_CONTEXT_TOKEN_THRESHOLD
+  const parsed = raw ? Number.parseInt(raw, 10) : 500000
+  if (!Number.isFinite(parsed) || parsed <= 0) return 500000
+  return parsed
+}
+
+const parseMicroCompactKeepRecent = () => {
+  const fromConfig = (loadAppConfig() as any)?.chat?.microCompactKeepRecent
+  if (typeof fromConfig === 'number' && Number.isFinite(fromConfig) && fromConfig > 0) {
+    return fromConfig
+  }
+  const raw = process.env.CHAT_MICRO_COMPACT_KEEP_RECENT
+  const parsed = raw ? Number.parseInt(raw, 10) : 3
+  if (!Number.isFinite(parsed) || parsed <= 0) return 3
+  return parsed
+}
+
+const parseTranscriptEnabled = () => {
+  const fromConfig = (loadAppConfig() as any)?.chat?.transcriptEnabled
+  if (typeof fromConfig === 'boolean') return fromConfig
+  const raw = process.env.CHAT_TRANSCRIPT_ENABLED
+  if (raw === undefined) return true
+  return raw.toLowerCase() !== 'false'
+}
+
+const parseTranscriptMaxBytes = () => {
+  const fromConfig = (loadAppConfig() as any)?.chat?.transcriptMaxBytes
+  if (typeof fromConfig === 'number' && Number.isFinite(fromConfig) && fromConfig > 0) {
+    return fromConfig
+  }
+  const raw = process.env.CHAT_TRANSCRIPT_MAX_BYTES
+  const parsed = raw ? Number.parseInt(raw, 10) : 5_000_000
+  if (!Number.isFinite(parsed) || parsed <= 0) return 5_000_000
   return parsed
 }
 
@@ -177,6 +220,61 @@ const splitTextForStream = (input: string, chunkSize = 800) => {
   return chunks
 }
 
+const estimateTokens = (text: string) => {
+  if (!text) return 0
+  return Math.floor(text.length / 4)
+}
+
+const estimateConversationTokens = (existingSummary: string | null, messages: Array<{ role: string; content: string }>) => {
+  const summaryBlock = existingSummary ? `Summary:\n${existingSummary}\n\n` : ''
+  const messagesBlock = messages.map((entry) => `${entry.role}: ${entry.content}`).join('\n')
+  return estimateTokens(`${summaryBlock}${messagesBlock}`)
+}
+
+const resolveTranscriptDir = (threadId: string) => {
+  return path.resolve(process.cwd(), 'storage', 'threads', threadId, 'transcripts')
+}
+
+const saveConversationTranscript = (params: {
+  threadId: string
+  reason: string
+  existingSummary: string | null
+  messages: Array<{ id?: string; role: string; content: string; createdAt?: number }>
+}) => {
+  if (!parseTranscriptEnabled()) return null
+  const dir = resolveTranscriptDir(params.threadId)
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true })
+  }
+  const transcriptPath = path.join(dir, `transcript_${Date.now()}.jsonl`)
+  const maxBytes = parseTranscriptMaxBytes()
+  let bytes = 0
+  const lines: string[] = []
+  const pushLine = (value: unknown) => {
+    const line = `${JSON.stringify(value)}\n`
+    bytes += Buffer.byteLength(line, 'utf-8')
+    if (bytes > maxBytes) return false
+    lines.push(line)
+    return true
+  }
+  pushLine({
+    type: 'meta',
+    threadId: params.threadId,
+    createdAt: Date.now(),
+    reason: params.reason,
+    summary: params.existingSummary
+  })
+  for (const message of params.messages) {
+    const ok = pushLine({ type: 'message', ...message })
+    if (!ok) {
+      lines.push(`${JSON.stringify({ type: 'truncated', reason: 'max_bytes_exceeded' })}\n`)
+      break
+    }
+  }
+  fs.writeFileSync(transcriptPath, lines.join(''), 'utf-8')
+  return transcriptPath
+}
+
 const formatMessagesForSummary = (messages: Array<{ role: string; content: string }>) => {
   return messages
     .map((message) => {
@@ -256,6 +354,26 @@ const SUBAGENT_PROMPT_MAP: Record<string, string> = {
 
 const MASTER_AGENT_NAME = 'master agent'
 
+const normalizeSubagentType = (raw: unknown) => {
+  const normalized = typeof raw === 'string' ? raw.trim().toLowerCase() : ''
+  if (!normalized) return 'general-purpose'
+  const generalPurposeAliases = new Set([
+    'general',
+    'generalpurpose',
+    'general-purpose',
+    'consulting',
+    'analysis',
+    'research',
+    'report',
+    'consulting-analysis',
+    'consulting_analysis'
+  ])
+  const bashAliases = new Set(['bash', 'shell', 'command', 'cli', 'terminal', 'ops'])
+  if (generalPurposeAliases.has(normalized)) return 'general-purpose'
+  if (bashAliases.has(normalized)) return 'bash'
+  return normalized
+}
+
 const buildSubagentDisplayName = (task: string, type: string) => {
   const text = task.toLowerCase()
   const scene =
@@ -274,81 +392,7 @@ const buildSubagentDisplayName = (task: string, type: string) => {
 }
 
 const buildLocalToolset = (threadData: ThreadData, threadId: string) => {
-  const tools: OpenAiToolDefinition[] = [
-    {
-      type: 'function',
-      function: {
-        name: 'read_file',
-        description: 'Read a text file from the skills or sandbox workspace',
-        parameters: {
-          type: 'object',
-          properties: {
-            path: { type: 'string' }
-          },
-          required: ['path']
-        }
-      }
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'bash',
-        description: 'Execute a shell command inside the sandbox workspace',
-        parameters: {
-          type: 'object',
-          properties: {
-            command: { type: 'string' },
-            cwd: { type: 'string' }
-          },
-          required: ['command']
-        }
-      }
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'write_file',
-        description: 'Write any generated file to the sandbox (always call this when the user expects a file)',
-        parameters: {
-          type: 'object',
-          properties: {
-            path: { type: 'string' },
-            content: { type: 'string' }
-          },
-          required: ['path', 'content']
-        }
-      }
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'task',
-        description: 'Delegate a task to a subagent and return its output',
-        parameters: {
-          type: 'object',
-          properties: {
-            subagent_type: { type: 'string' },
-            task: { type: 'string' }
-          },
-          required: ['task']
-        }
-      }
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'list_dir',
-        description: 'List directory contents in the sandbox workspace or skills',
-        parameters: {
-          type: 'object',
-          properties: {
-            path: { type: 'string' }
-          },
-          required: ['path']
-        }
-      }
-    }
-  ]
+  const tools: OpenAiToolDefinition[] = BUILTIN_TOOL_DEFINITIONS
   const skillsRoot = resolveSkillsPath()
   const skillsContainerPath = getSkillsContainerPath()
   const sandboxPrefix = '/mnt/user-data'
@@ -451,6 +495,12 @@ const buildLocalToolset = (threadData: ThreadData, threadId: string) => {
     }))
     return JSON.stringify(output)
   })
+  localToolMap.set('web_search', async (args, context) => {
+    return runTavilyWebSearch(args, context?.signal)
+  })
+  localToolMap.set('websearch', async (args, context) => {
+    return runTavilyWebSearch(args, context?.signal)
+  })
   localToolMap.set('bash', (args) => {
     const command = args?.command
     const cwd = args?.cwd
@@ -514,8 +564,7 @@ const buildLocalToolset = (threadData: ThreadData, threadId: string) => {
     const ctx = context
     const rawType = args?.subagent_type
     const rawTask = args?.task ?? args?.input ?? args?.prompt
-    const subagentType =
-      typeof rawType === 'string' && rawType.trim().length > 0 ? rawType.trim().toLowerCase() : 'general-purpose'
+    const subagentType = normalizeSubagentType(rawType)
     if (typeof rawTask !== 'string' || rawTask.trim().length === 0) {
       throw new Error('Invalid task')
     }
@@ -634,6 +683,14 @@ const buildLocalToolset = (threadData: ThreadData, threadId: string) => {
     })
   })
   return { tools, localToolMap }
+}
+
+const buildFlashToolset = (threadData: ThreadData, threadId: string) => {
+  const local = buildLocalToolset(threadData, threadId)
+  const tools = local.tools.filter((tool) => tool.function?.name !== 'task')
+  const localToolMap = new Map(local.localToolMap)
+  localToolMap.delete('task')
+  return { tools, toolMap: new Map(), localToolMap }
 }
 
 const maybeLoadMcpToolset = async (model: ModelConfig, threadData: ThreadData, threadId: string) => {
@@ -827,6 +884,71 @@ const formatToolResultForModel = (toolName: string, result: unknown) => {
     return truncateTextHeadTail(raw, 6000, 4200, 1200)
   }
   return truncateTextHeadTail(raw, 9000, 6000, 1800)
+}
+
+const microCompactOpenAiToolResults = (messages: OpenAiMessage[]) => {
+  const keepRecent = parseMicroCompactKeepRecent()
+  const toolMessageIndexes: number[] = []
+  const toolNameMap = new Map<string, string>()
+  for (const msg of messages) {
+    if (msg.role !== 'assistant') continue
+    const toolCalls = (msg as any)?.tool_calls
+    if (!Array.isArray(toolCalls)) continue
+    for (const call of toolCalls) {
+      const id = typeof call?.id === 'string' ? call.id : null
+      const name = typeof call?.function?.name === 'string' ? call.function.name : null
+      if (id && name) toolNameMap.set(id, name)
+    }
+  }
+  for (let i = 0; i < messages.length; i += 1) {
+    if (messages[i]?.role === 'tool') toolMessageIndexes.push(i)
+  }
+  if (toolMessageIndexes.length <= keepRecent) return messages
+  const toCompact = toolMessageIndexes.slice(0, Math.max(0, toolMessageIndexes.length - keepRecent))
+  for (const idx of toCompact) {
+    const msg = messages[idx]
+    const content = msg?.content ?? ''
+    if (typeof content !== 'string' || content.length <= 100) continue
+    const callId = typeof (msg as any)?.tool_call_id === 'string' ? (msg as any).tool_call_id : ''
+    const toolName = toolNameMap.get(callId) ?? 'unknown'
+    msg.content = `[Previous: used ${toolName}]`
+  }
+  return messages
+}
+
+const microCompactAnthropicToolResults = (messages: AnthropicMessage[]) => {
+  const keepRecent = parseMicroCompactKeepRecent()
+  const toolResults: Array<{ msgIndex: number; blockIndex: number }> = []
+  const toolNameMap = new Map<string, string>()
+  for (const msg of messages) {
+    if (msg.role !== 'assistant') continue
+    if (!Array.isArray(msg.content)) continue
+    for (const block of msg.content) {
+      if (block.type === 'tool_use' && block.id && block.name) {
+        toolNameMap.set(block.id, block.name)
+      }
+    }
+  }
+  for (let msgIndex = 0; msgIndex < messages.length; msgIndex += 1) {
+    const msg = messages[msgIndex]
+    if (msg.role !== 'user' || !Array.isArray(msg.content)) continue
+    for (let blockIndex = 0; blockIndex < msg.content.length; blockIndex += 1) {
+      const block = msg.content[blockIndex]
+      if (block.type === 'tool_result') toolResults.push({ msgIndex, blockIndex })
+    }
+  }
+  if (toolResults.length <= keepRecent) return messages
+  const toCompact = toolResults.slice(0, Math.max(0, toolResults.length - keepRecent))
+  for (const ref of toCompact) {
+    const msg = messages[ref.msgIndex]
+    if (!Array.isArray(msg.content)) continue
+    const block = msg.content[ref.blockIndex]
+    if (!block || block.type !== 'tool_result') continue
+    if (typeof block.content !== 'string' || block.content.length <= 100) continue
+    const toolName = toolNameMap.get(block.tool_use_id) ?? 'unknown'
+    block.content = `[Previous: used ${toolName}]`
+  }
+  return messages
 }
 
 const executeMcpToolCalls = async (
@@ -1516,6 +1638,7 @@ const callOpenAiWithMcp = async (
   const collectedTools: string[] = []
   const maxRounds = 20
   for (let round = 0; round < maxRounds; round += 1) {
+    microCompactOpenAiToolResults(currentMessages)
     const toolPayload = { ...(requestExtras ?? {}), tools: toolset.tools, tool_choice: 'auto' }
     const step = await callOpenAiCompatibleStreamWithMeta(
       currentMessages,
@@ -1848,6 +1971,7 @@ const streamAnthropicWithMcp = async (
   const maxRounds = 20
 
   for (let round = 0; round < maxRounds; round += 1) {
+    microCompactAnthropicToolResults(currentMessages)
     const step = await callAnthropicStreamWithToolMeta(
       currentMessages,
       system,
@@ -1945,6 +2069,7 @@ const callAnthropicWithMcp = async (
   const maxRounds = 20
 
   for (let round = 0; round < maxRounds; round += 1) {
+    microCompactAnthropicToolResults(currentMessages)
     const step = await callAnthropicWithToolMeta(
       currentMessages,
       system,
@@ -2035,6 +2160,7 @@ const streamOpenAiWithMcp = async (
   const maxRounds = 20
   const collectedTools: string[] = []
   for (let round = 0; round < maxRounds; round += 1) {
+    microCompactOpenAiToolResults(currentMessages)
     const toolPayload = { ...(requestExtras ?? {}), tools: toolset.tools, tool_choice: 'auto' }
     const step = await callOpenAiCompatibleStreamWithMeta(
       currentMessages,
@@ -2248,10 +2374,14 @@ const summarizeConversation = async (
   model: ModelConfig,
   existingSummary: string | null,
   messages: Array<{ role: string; content: string }>,
-  onUsage?: (usage: TokenUsage) => void
+  onUsage?: (usage: TokenUsage) => void,
+  focus?: string | null
 ) => {
-  const prompt = 'You are a summarization assistant. Summarize the conversation to preserve important facts, decisions, and user preferences. Keep it concise.'
-  const input = buildSummaryInput(existingSummary, messages)
+  const focusLine = focus ? `\n\nPreserve especially:\n${focus}` : ''
+  const prompt =
+    'You are a summarization assistant. Summarize the conversation to preserve important facts, decisions, and user preferences. Keep it concise.' +
+    focusLine
+  const input = truncateTextHeadTail(buildSummaryInput(existingSummary, messages), 80000, 52000, 18000)
   if (model.protocol === 'openai' || model.protocol === 'openai_compatible') {
     const summary = await callOpenAiCompatibleStreamWithMeta(
       [
@@ -2277,6 +2407,80 @@ const summarizeConversation = async (
     512
   )
   return summary.text.trim()
+}
+
+const compactThreadIfNeeded = async (params: {
+  model: ModelConfig
+  thread: { id: string; summary: string | null; messages: Array<{ id: string; role: string; content: string; createdAt: number }> }
+  onUsage?: (usage: TokenUsage) => void
+  force?: boolean
+  focus?: string | null
+}) => {
+  const nonSystemMessages = params.thread.messages.filter((entry) => entry.role !== 'system')
+  if (!nonSystemMessages.length) return { didCompact: false, transcriptPath: null }
+
+  const summaryKeep = parseSummaryKeepMessages()
+  const summaryTrigger = parseSummaryTriggerMessages()
+  const tokenThreshold = parseContextTokenThreshold()
+
+  const shouldByCount = nonSystemMessages.length > summaryTrigger
+  const shouldByTokens =
+    tokenThreshold > 0
+      ? estimateConversationTokens(
+          params.thread.summary ?? null,
+          nonSystemMessages.map((entry) => ({ role: entry.role, content: entry.content }))
+        ) > tokenThreshold
+      : false
+
+  const enabled = parseSummaryEnabled()
+  const shouldCompact = Boolean(params.force) || (enabled && (shouldByCount || shouldByTokens))
+  if (!shouldCompact) return { didCompact: false, transcriptPath: null }
+
+  const systemMessages = params.thread.messages.filter((entry) => entry.role === 'system')
+  let keepCount = Math.min(summaryKeep, nonSystemMessages.length)
+  if (params.force && nonSystemMessages.length > 1 && keepCount >= nonSystemMessages.length) {
+    keepCount = Math.max(1, nonSystemMessages.length - 1)
+  }
+  if (tokenThreshold > 0) {
+    const reservedTokensForKeep = Math.floor(tokenThreshold * 0.65)
+    while (keepCount > 2) {
+      const keepCandidate = nonSystemMessages.slice(-keepCount)
+      const keepTokens = estimateConversationTokens(
+        null,
+        keepCandidate.map((entry) => ({ role: entry.role, content: entry.content }))
+      )
+      if (keepTokens <= reservedTokensForKeep) break
+      keepCount -= 1
+    }
+  }
+  const keepMessages = nonSystemMessages.slice(-keepCount)
+  const toSummarize = nonSystemMessages.slice(0, Math.max(0, nonSystemMessages.length - keepMessages.length))
+
+  const transcriptPath = saveConversationTranscript({
+    threadId: params.thread.id,
+    reason: params.force ? 'manual_compact' : shouldByTokens ? 'auto_compact_tokens' : 'auto_compact_messages',
+    existingSummary: params.thread.summary ?? null,
+    messages: params.thread.messages
+  })
+
+  if (!toSummarize.length) {
+    return { didCompact: false, transcriptPath }
+  }
+
+  const summary = await summarizeConversation(
+    params.model,
+    params.thread.summary ?? null,
+    toSummarize.map((entry) => ({ role: entry.role, content: entry.content })),
+    params.onUsage,
+    params.focus ?? null
+  )
+
+  const updatedThread = updateThreadSummary(params.thread.id, summary, [...systemMessages, ...keepMessages] as any)
+  if (updatedThread) {
+    params.thread.messages = updatedThread.messages as any
+    params.thread.summary = updatedThread.summary as any
+  }
+  return { didCompact: Boolean(updatedThread), transcriptPath }
 }
 
 const generateThinkingSummary = async (
@@ -2312,6 +2516,13 @@ const generateThinkingSummary = async (
     256
   )
   return summary.text.trim()
+}
+
+const parseCompactCommand = (message: string) => {
+  const match = message.trim().match(/^\/compact\s*(.*)$/)
+  if (!match) return null
+  const focus = (match[1] ?? '').trim()
+  return { focus: focus.length > 0 ? focus : null }
 }
 
 const parseSkillCommand = (message: string) => {
@@ -2844,8 +3055,10 @@ chatRoute.post('/stream', async (c) => {
   const rawMessage = multiAgentCommand ? multiAgentCommand.content : body.message
   const artifactCommand = parseArtifactCommand(rawMessage)
   const rawMessageWithoutArtifact = artifactCommand ? artifactCommand.content : rawMessage
-  const skillCommand = parseSkillCommand(rawMessageWithoutArtifact)
-  const message = skillCommand ? (skillCommand.content || `使用技能 ${skillCommand.skillId}`) : rawMessageWithoutArtifact
+  const compactCommand = parseCompactCommand(rawMessageWithoutArtifact)
+  const rawMessageWithoutCompact = compactCommand ? '' : rawMessageWithoutArtifact
+  const skillCommand = parseSkillCommand(rawMessageWithoutCompact)
+  let message = skillCommand ? (skillCommand.content || `使用技能 ${skillCommand.skillId}`) : rawMessageWithoutCompact
   // 解析模型与线程
   const modelId = body.modelId
   const incomingThreadId = body.threadId
@@ -2860,18 +3073,23 @@ chatRoute.post('/stream', async (c) => {
   const threadData = ensureThreadData(thread.id)
   const tokenUsage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 }
   const onUsage = (usage: TokenUsage) => mergeTokenUsage(tokenUsage, usage)
+  const isFlash = body.mode === 'flash'
   let autoSkill: SkillDefinition | null = null
-  if (!skillCommand) {
-    autoSkill = await maybeSelectSkill(rawMessageWithoutArtifact, model, c.req.raw.signal, onUsage)
+  if (!skillCommand && !isFlash && rawMessageWithoutCompact.trim().length > 0) {
+    autoSkill = await maybeSelectSkill(rawMessageWithoutCompact, model, c.req.raw.signal, onUsage)
   }
 
-  // 写入用户消息
-  appendMessage(thread.id, {
-    id: randomUUID(),
-    role: 'user',
-    content: message,
-    createdAt: Date.now()
-  })
+  if (compactCommand) {
+    await compactThreadIfNeeded({ model, thread: thread as any, onUsage, force: true, focus: compactCommand.focus })
+  }
+  if (message.trim().length > 0) {
+    appendMessage(thread.id, {
+      id: randomUUID(),
+      role: 'user',
+      content: message,
+      createdAt: Date.now()
+    })
+  }
 
   // 设置 SSE 响应头
   const headers: Record<string, string> = {
@@ -3212,35 +3430,43 @@ chatRoute.post('/stream', async (c) => {
 
       ;(async () => {
         try {
-          // 触发自动摘要并维护上下文
-          if (parseSummaryEnabled()) {
-            const summaryTrigger = parseSummaryTriggerMessages()
-            const summaryKeep = parseSummaryKeepMessages()
-            const nonSystemMessages = thread.messages.filter((entry) => entry.role !== 'system')
-            if (nonSystemMessages.length > summaryTrigger) {
-              const toSummarize = nonSystemMessages.slice(0, Math.max(0, nonSystemMessages.length - summaryKeep))
-              const keepMessages = nonSystemMessages.slice(-summaryKeep)
-              if (toSummarize.length > 0) {
-              const summary = await summarizeConversation(model, thread.summary ?? null, toSummarize, onUsage)
-                const updatedThread = updateThreadSummary(thread.id, summary, keepMessages)
-                if (updatedThread) {
-                  thread.messages = updatedThread.messages
-                  thread.summary = updatedThread.summary
-                }
-              }
-            }
+          if (compactCommand && message.trim().length === 0) {
+            const responseText = '已进行上下文压缩。'
+            splitTextForStream(responseText).forEach((chunk) => {
+              send('delta', { delta: chunk })
+            })
+            const updated = appendMessage(thread.id, {
+              id: randomUUID(),
+              role: 'assistant',
+              content: responseText,
+              meta: {
+                tokenUsage: tokenUsage.totalTokens > 0 ? tokenUsage : undefined
+              },
+              createdAt: Date.now()
+            })
+            const latestMeta = updated?.messages?.[updated.messages.length - 1]?.meta ?? null
+            send('done', {
+              modelId: model.id,
+              threadId: thread.id,
+              messages: updated?.messages ?? [],
+              meta: latestMeta
+            })
+            return
           }
+          await compactThreadIfNeeded({ model, thread: thread as any, onUsage, force: false, focus: null })
 
           // 组装系统提示词
           const systemMessages = thread.messages.filter((entry) => entry.role === 'system')
           const systemTextParts: string[] = []
-          systemTextParts.push(MASTER_AGENT_PROMPT)
-          const skillsPromptSection = buildSkillSystemSection()
-          if (skillsPromptSection) {
-            systemTextParts.push(skillsPromptSection)
-          }
-          if (body.mode === 'vibefishing') {
-            systemTextParts.push(VIBEFISHING_SUBAGENT_GUIDE)
+          if (!isFlash) {
+            systemTextParts.push(MASTER_AGENT_PROMPT)
+            const skillsPromptSection = buildSkillSystemSection()
+            if (skillsPromptSection) {
+              systemTextParts.push(skillsPromptSection)
+            }
+            if (body.mode === 'vibefishing') {
+              systemTextParts.push(VIBEFISHING_SUBAGENT_GUIDE)
+            }
           }
           if (artifactCommand) {
             systemTextParts.push('You are generating content for a text file. Output only the file content with no extra explanations.')
@@ -3273,9 +3499,9 @@ chatRoute.post('/stream', async (c) => {
           const contextBlock = buildContextBlock(contextSlice)
           const { isPro, thinkingEnabled } = resolveModeFlags(body.mode)
           const ultraEnabled = body.mode === 'ultra'
-          const multiAgentEnabled = Boolean(body.multiAgent) || Boolean(multiAgentCommand) || body.mode === 'ultra'
+          const multiAgentEnabled = !isFlash && (Boolean(body.multiAgent) || Boolean(multiAgentCommand) || body.mode === 'ultra')
           const openAiThinkingExtras = thinkingEnabled ? getThinkingRequestExtras(model) : undefined
-          const mcpToolset = await maybeLoadMcpToolset(model, threadData, thread.id)
+          const mcpToolset = isFlash ? buildFlashToolset(threadData, thread.id) : await maybeLoadMcpToolset(model, threadData, thread.id)
 
           // 生成回复并流式发送
           let finalResponse = ''
@@ -3352,7 +3578,52 @@ chatRoute.post('/stream', async (c) => {
             maxSubagentCalls: 3
           }
 
-          if (multiAgentEnabled) {
+          if (isFlash) {
+            if (model.protocol === 'openai' || model.protocol === 'openai_compatible') {
+              const openAiMessages: Array<{ role: 'user' | 'assistant' | 'system'; content: string }> = []
+              if (systemText) {
+                openAiMessages.push({ role: 'system', content: systemText })
+              }
+              openAiMessages.push(
+                ...contextSlice.map((entry) => ({ role: entry.role as 'user' | 'assistant', content: entry.content }))
+              )
+              const result = await streamOpenAiWithMcp(
+                openAiMessages as any,
+                model,
+                c.req.raw.signal,
+                undefined,
+                mcpToolset,
+                (chunk) => {
+                  if (chunk.type !== 'content') return
+                  finalResponse += chunk.value
+                  send('delta', { delta: chunk.value })
+                },
+                onToolEvent,
+                toolContext
+              )
+              tools.push(...(result.tools ?? []))
+            } else if (model.protocol === 'anthropic') {
+              const anthropicMessages = contextSlice.map((entry) => ({
+                role: entry.role as 'user' | 'assistant',
+                content: entry.content
+              }))
+              const result = await streamAnthropicWithMcp(
+                anthropicMessages,
+                systemText,
+                model,
+                c.req.raw.signal,
+                mcpToolset,
+                (delta) => {
+                  finalResponse += delta
+                  send('delta', { delta })
+                },
+                toolContext
+              )
+              tools.push(...(result.tools ?? []))
+            } else {
+              throw new Error(`Unsupported model protocol: ${model.protocol}`)
+            }
+          } else if (multiAgentEnabled) {
             const onReasoning = (delta: string) => {
               if (!reasoningActive) {
                 reasoningActive = true
@@ -3654,11 +3925,13 @@ chatRoute.post('/stream', async (c) => {
             })
           }
           // 生成思考摘要（如开启）
-          const thinkingSummary = reasoningContent.trim()
+          const thinkingSummary = !isFlash
             ? reasoningContent.trim()
-            : parseThinkingSummaryEnabled()
-              ? await generateThinkingSummary(model, message, finalResponse, onUsage).catch(() => null)
-              : null
+              ? reasoningContent.trim()
+              : parseThinkingSummaryEnabled()
+                ? await generateThinkingSummary(model, message, finalResponse, onUsage).catch(() => null)
+                : null
+            : null
 
           // 持久化产物与助手消息
           const toolArtifacts = toolTimeline.length > 0 ? buildFileArtifacts(toolTimeline) : []
@@ -3721,8 +3994,10 @@ chatRoute.post('/', async (c) => {
     const rawMessage = multiAgentCommand ? multiAgentCommand.content : body.message
     const artifactCommand = parseArtifactCommand(rawMessage)
     const rawMessageWithoutArtifact = artifactCommand ? artifactCommand.content : rawMessage
-    const skillCommand = parseSkillCommand(rawMessageWithoutArtifact)
-    const message = skillCommand ? (skillCommand.content || `使用技能 ${skillCommand.skillId}`) : rawMessageWithoutArtifact
+    const compactCommand = parseCompactCommand(rawMessageWithoutArtifact)
+    const rawMessageWithoutCompact = compactCommand ? '' : rawMessageWithoutArtifact
+    const skillCommand = parseSkillCommand(rawMessageWithoutCompact)
+    let message = skillCommand ? (skillCommand.content || `使用技能 ${skillCommand.skillId}`) : rawMessageWithoutCompact
     const modelId = body.modelId
     const incomingThreadId = body.threadId
     const thread = incomingThreadId ? getThread(incomingThreadId) : createThread()
@@ -3736,9 +4011,10 @@ chatRoute.post('/', async (c) => {
     }
     const tokenUsage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 }
     const onUsage = (usage: TokenUsage) => mergeTokenUsage(tokenUsage, usage)
+    const isFlash = body.mode === 'flash'
     let autoSkill: SkillDefinition | null = null
-    if (!skillCommand) {
-      autoSkill = await maybeSelectSkill(rawMessageWithoutArtifact, model, c.req.raw.signal, onUsage)
+    if (!skillCommand && !isFlash && rawMessageWithoutCompact.trim().length > 0) {
+      autoSkill = await maybeSelectSkill(rawMessageWithoutCompact, model, c.req.raw.signal, onUsage)
     }
 
     console.info('chat request', {
@@ -3749,40 +4025,52 @@ chatRoute.post('/', async (c) => {
       multiAgent: Boolean(body.multiAgent) || Boolean(multiAgentCommand)
     })
 
-    appendMessage(thread.id, {
-      id: randomUUID(),
-      role: 'user',
-      content: message,
-      createdAt: Date.now()
-    })
-
-    if (parseSummaryEnabled()) {
-      const summaryTrigger = parseSummaryTriggerMessages()
-      const summaryKeep = parseSummaryKeepMessages()
-      const nonSystemMessages = thread.messages.filter((entry) => entry.role !== 'system')
-      if (nonSystemMessages.length > summaryTrigger) {
-        const toSummarize = nonSystemMessages.slice(0, Math.max(0, nonSystemMessages.length - summaryKeep))
-        const keepMessages = nonSystemMessages.slice(-summaryKeep)
-        if (toSummarize.length > 0) {
-          const summary = await summarizeConversation(model, thread.summary ?? null, toSummarize, onUsage)
-          const updatedThread = updateThreadSummary(thread.id, summary, keepMessages)
-          if (updatedThread) {
-            thread.messages = updatedThread.messages
-            thread.summary = updatedThread.summary
-          }
-        }
-      }
+    if (compactCommand) {
+      await compactThreadIfNeeded({ model, thread: thread as any, onUsage, force: true, focus: compactCommand.focus })
     }
+    if (message.trim().length > 0) {
+      appendMessage(thread.id, {
+        id: randomUUID(),
+        role: 'user',
+        content: message,
+        createdAt: Date.now()
+      })
+    }
+
+    if (compactCommand && message.trim().length === 0) {
+      const responseText = '已进行上下文压缩。'
+      const updated = appendMessage(thread.id, {
+        id: randomUUID(),
+        role: 'assistant',
+        content: responseText,
+        meta: {
+          tokenUsage: tokenUsage.totalTokens > 0 ? tokenUsage : undefined
+        },
+        createdAt: Date.now()
+      })
+      const latestMeta = updated?.messages?.[updated.messages.length - 1]?.meta ?? null
+      return c.json({
+        response: responseText,
+        modelId: model.id,
+        threadId: thread.id,
+        messages: updated?.messages ?? [],
+        meta: latestMeta
+      })
+    }
+
+    await compactThreadIfNeeded({ model, thread: thread as any, onUsage, force: false, focus: null })
 
     const systemMessages = thread.messages.filter((entry) => entry.role === 'system')
     const systemTextParts: string[] = []
-    systemTextParts.push(MASTER_AGENT_PROMPT)
-    const skillsPromptSection = buildSkillSystemSection()
-    if (skillsPromptSection) {
-      systemTextParts.push(skillsPromptSection)
-    }
-    if (body.mode === 'vibefishing') {
-      systemTextParts.push(VIBEFISHING_SUBAGENT_GUIDE)
+    if (!isFlash) {
+      systemTextParts.push(MASTER_AGENT_PROMPT)
+      const skillsPromptSection = buildSkillSystemSection()
+      if (skillsPromptSection) {
+        systemTextParts.push(skillsPromptSection)
+      }
+      if (body.mode === 'vibefishing') {
+        systemTextParts.push(VIBEFISHING_SUBAGENT_GUIDE)
+      }
     }
     if (artifactCommand) {
       systemTextParts.push('You are generating content for a text file. Output only the file content with no extra explanations.')
@@ -3811,10 +4099,83 @@ chatRoute.post('/', async (c) => {
     const contextBlock = buildContextBlock(contextSlice)
     const { isPro, thinkingEnabled } = resolveModeFlags(body.mode)
     const ultraEnabled = body.mode === 'ultra'
-    const multiAgentEnabled = Boolean(body.multiAgent) || Boolean(multiAgentCommand) || ultraEnabled
+    const multiAgentEnabled = !isFlash && (Boolean(body.multiAgent) || Boolean(multiAgentCommand) || ultraEnabled)
     const openAiThinkingExtras = thinkingEnabled ? getThinkingRequestExtras(model) : undefined
     const threadData = ensureThreadData(thread.id)
-    const mcpToolset = await maybeLoadMcpToolset(model, threadData, thread.id)
+    const mcpToolset = isFlash ? buildFlashToolset(threadData, thread.id) : await maybeLoadMcpToolset(model, threadData, thread.id)
+
+    if (isFlash) {
+      let response = ''
+      let tools: string[] = []
+      if (model.protocol === 'openai' || model.protocol === 'openai_compatible') {
+        const openAiMessages: Array<{ role: 'user' | 'assistant' | 'system'; content: string }> = []
+        if (systemText) {
+          openAiMessages.push({ role: 'system', content: systemText })
+        }
+        openAiMessages.push(
+          ...contextSlice.map((entry) => ({ role: entry.role as 'user' | 'assistant', content: entry.content }))
+        )
+        const toolContext: ToolExecutionContext = {
+          model,
+          systemText,
+          threadId: thread.id,
+          toolset: mcpToolset,
+          onUsage,
+          signal: c.req.raw.signal
+        }
+        const result = await callOpenAiWithMcp(openAiMessages as any, model, undefined, mcpToolset, toolContext)
+        response = result.content
+        tools = result.tools ?? []
+      } else if (model.protocol === 'anthropic') {
+        const anthropicMessages = contextSlice.map((entry) => ({
+          role: entry.role as 'user' | 'assistant',
+          content: entry.content
+        }))
+        const toolContext: ToolExecutionContext = {
+          model,
+          systemText,
+          threadId: thread.id,
+          toolset: mcpToolset,
+          onUsage,
+          signal: c.req.raw.signal
+        }
+        const result = await callAnthropicWithMcp(
+          anthropicMessages,
+          systemText,
+          model,
+          undefined,
+          mcpToolset,
+          toolContext
+        )
+        response = result.content
+        tools = result.tools ?? []
+      } else {
+        return c.json({ error: 'Unsupported model protocol', modelId: model.id }, 400)
+      }
+      const artifacts = artifactCommand
+        ? [saveTextArtifact(thread.id, artifactCommand.fileName, response)]
+        : []
+      const updated = appendMessage(thread.id, {
+        id: randomUUID(),
+        role: 'assistant',
+        content: response,
+        meta: {
+          skills: activeSkillId ? [activeSkillId] : [],
+          tools: tools.length > 0 ? tools : undefined,
+          artifacts: artifacts.length > 0 ? artifacts : undefined,
+          tokenUsage: tokenUsage.totalTokens > 0 ? tokenUsage : undefined
+        },
+        createdAt: Date.now()
+      })
+      const latestMeta = updated?.messages?.[updated.messages.length - 1]?.meta ?? null
+      return c.json({
+        response,
+        modelId: model.id,
+        threadId: thread.id,
+        messages: updated?.messages ?? [],
+        meta: latestMeta
+      })
+    }
 
     if (multiAgentEnabled) {
       const start = Date.now()
@@ -4198,5 +4559,7 @@ chatRoute.post('/', async (c) => {
 
 export const __test__ = {
   resolveModeFlags,
-  getThinkingRequestExtras
+  getThinkingRequestExtras,
+  normalizeSubagentType,
+  buildFlashToolset: (threadId: string) => buildFlashToolset(ensureThreadData(threadId), threadId)
 }

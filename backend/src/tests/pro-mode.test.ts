@@ -1,7 +1,7 @@
 import { strict as assert } from 'node:assert'
 import { __test__ } from '../routes/chat'
 
-const { resolveModeFlags, getThinkingRequestExtras } = __test__
+const { resolveModeFlags, getThinkingRequestExtras, normalizeSubagentType } = __test__
 
 const baseModel = {
   id: 'test',
@@ -45,5 +45,11 @@ assert.equal(ultra.thinkingEnabled, true)
 
 assert.equal(getThinkingRequestExtras(noThinkingModel), undefined)
 assert.deepEqual(getThinkingRequestExtras(supportsThinkingModel), supportsThinkingModel.whenThinkingEnabled)
+
+assert.equal(normalizeSubagentType(undefined), 'general-purpose')
+assert.equal(normalizeSubagentType('consulting-analysis'), 'general-purpose')
+assert.equal(normalizeSubagentType('CONSULTING_ANALYSIS'), 'general-purpose')
+assert.equal(normalizeSubagentType('bash'), 'bash')
+assert.equal(normalizeSubagentType('shell'), 'bash')
 
 console.log('pro-mode tests passed')
