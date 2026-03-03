@@ -124,6 +124,11 @@ export function Chat({ threadId }: ChatProps) {
     if (typeof window === 'undefined') return;
     window.localStorage.setItem(MODE_STORAGE_KEY, mode);
   }, [mode]);
+  useEffect(() => {
+    if (mode === 'flash' && agentPanelOpen) {
+      setAgentPanelOpen(false);
+    }
+  }, [mode, agentPanelOpen]);
 
   const selectedModel = useMemo(
     () => models.find((m) => m.id === selectedModelId),
@@ -133,6 +138,7 @@ export function Chat({ threadId }: ChatProps) {
     () => MODE_OPTIONS.find((opt) => opt.value === mode),
     [mode]
   );
+  const isFlash = mode === 'flash';
   const assistantMessages = useMemo(() => {
     return messages.filter((message) => message.role === 'assistant');
   }, [messages]);
@@ -1237,13 +1243,15 @@ export function Chat({ threadId }: ChatProps) {
           </span>
         </div>
         <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setAgentPanelOpen(true)}
-            className="h-9 px-3 rounded-lg border border-zinc-200/70 dark:border-zinc-700/70 text-xs font-medium shadow-sm transition-colors bg-white/80 dark:bg-zinc-900/70 text-zinc-700 dark:text-zinc-200 hover:bg-white dark:hover:bg-zinc-800"
-          >
-            Agent
-          </button>
+          {!isFlash && (
+            <button
+              type="button"
+              onClick={() => setAgentPanelOpen(true)}
+              className="h-9 px-3 rounded-lg border border-zinc-200/70 dark:border-zinc-700/70 text-xs font-medium shadow-sm transition-colors bg-white/80 dark:bg-zinc-900/70 text-zinc-700 dark:text-zinc-200 hover:bg-white dark:hover:bg-zinc-800"
+            >
+              Agent
+            </button>
+          )}
           <button
             type="button"
             onClick={() => setPreviewOpen(true)}
@@ -1300,7 +1308,7 @@ export function Chat({ threadId }: ChatProps) {
             />
           </div>
         </div>
-        {agentPanelOpen && (
+        {agentPanelOpen && !isFlash && (
           <div className="absolute inset-0 z-30">
             <button
               type="button"
