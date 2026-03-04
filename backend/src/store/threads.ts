@@ -73,11 +73,21 @@ export interface ThreadMessage {
   createdAt: number
 }
 
+export interface ThreadSandboxState {
+  provider: 'volcengine' | 'local' | 'docker'
+  functionId?: string
+  sandboxId: string
+  apiUrl: string
+  uiUrl: string
+  createdAt: number
+}
+
 export interface ThreadState {
   id: string
   title: string
   messages: ThreadMessage[]
   summary: string | null
+  sandbox?: ThreadSandboxState | null
   createdAt: number
   updatedAt: number
 }
@@ -126,6 +136,10 @@ const loadThreads = () => {
         title: thread.title,
         messages: thread.messages as ThreadMessage[],
         summary: typeof thread.summary === 'string' ? thread.summary : null,
+        sandbox:
+          thread.sandbox && typeof thread.sandbox === 'object'
+            ? (thread.sandbox as ThreadSandboxState)
+            : null,
         createdAt: thread.createdAt,
         updatedAt: thread.updatedAt
       })
@@ -182,16 +196,32 @@ export const getThread = (id: string) => {
 
 export const createThread = () => {
   purgeExpiredThreads()
+  return createThreadWithId(randomUUID(), null)
+}
+
+export const createThreadWithId = (id: string, sandbox: ThreadSandboxState | null) => {
+  purgeExpiredThreads()
   const now = Date.now()
   const thread: ThreadState = {
-    id: randomUUID(),
+    id,
     title: 'Untitled',
     messages: [],
     summary: null,
+    sandbox,
     createdAt: now,
     updatedAt: now
   }
   threads.set(thread.id, thread)
+  persistThreads()
+  return thread
+}
+
+export const updateThreadSandbox = (threadId: string, sandbox: ThreadSandboxState | null) => {
+  purgeExpiredThreads()
+  const thread = threads.get(threadId)
+  if (!thread) return null
+  thread.sandbox = sandbox
+  thread.updatedAt = Date.now()
   persistThreads()
   return thread
 }

@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { Annotation, END, START, StateGraph } from '@langchain/langgraph'
 import { z } from 'zod'
+import { SandboxClient } from '@agent-infra/sandbox'
 import { findModelConfig, getModelConfigs, type ModelConfig } from '../config/models'
 import { loadAppConfig } from '../config/appConfig'
 import { getSubagentConfig, getSubagentNames } from '../subagents/registry'
@@ -16,7 +17,7 @@ import {
   SUBAGENT_PROMPT,
   VIBEFISHING_SUBAGENT_GUIDE
 } from '../prompts/chatPrompts'
-import { appendMessage, createThread, getThread, updateThreadSummary } from '../store/threads'
+import { appendMessage, createThreadWithId, getThread, updateThreadSandbox, updateThreadSummary } from '../store/threads'
 import { saveFileArtifact, saveTextArtifact } from '../store/artifacts'
 import { getSkillByName, loadSkills, resolveSkillsPath, type SkillDefinition } from '../skills/loader'
 import { executeMcpTool, loadMcpToolset, type OpenAiToolDefinition } from '../mcp/tools'
@@ -29,6 +30,7 @@ import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { MASTER_AGENT_PROMPT, buildSkillSystemSection } from '../agents/masterAgent'
 import { ensureThreadData, getSkillsContainerPath, type ThreadData } from '../sandbox/threadData'
+import { createSandboxForThread, isSandboxLifecycleEnabled } from '../sandbox/lifecycle'
 
 export const chatRoute = new Hono()
 
@@ -132,6 +134,77 @@ const parseMcpEnabled = () => {
   if (raw === undefined) return true
   return raw.toLowerCase() !== 'false'
 }
+
+const parseSandboxApiUrl = () => {
+  const raw = process.env.SANDBOX_API_URL ?? process.env.SANDBOX_API_ENVIRONMENT
+  if (!raw || raw.trim().length === 0) return null
+  return raw.trim()
+}
+
+const parseSandboxHeaders = () => {
+  const raw = process.env.SANDBOX_API_HEADERS
+  if (!raw || raw.trim().length === 0) return undefined
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
+    const entries = Object.entries(parsed as Record<string, unknown>)
+    const headers: Record<string, string> = {}
+    for (const [key, value] of entries) {
+      if (typeof value === 'string') headers[key] = value
+    }
+    return Object.keys(headers).length > 0 ? headers : undefined
+  } catch {
+    return undefined
+  }
+}
+
+const parseSandboxTimeoutSeconds = () => {
+  const raw = process.env.SANDBOX_API_TIMEOUT_SECONDS
+  if (!raw) return undefined
+  const parsed = Number.parseInt(raw, 10)
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined
+  return parsed
+}
+
+const parseSandboxShellTimeoutSeconds = () => {
+  const raw = process.env.SANDBOX_SHELL_TIMEOUT_SECONDS
+  const parsed = raw ? Number.parseInt(raw, 10) : 600
+  if (!Number.isFinite(parsed) || parsed <= 0) return 600
+  return parsed
+}
+
+const parseSandboxPerThread = () => {
+  const raw = process.env.SANDBOX_PER_THREAD
+  if (raw === undefined) return false
+  return raw.toLowerCase() === 'true'
+}
+
+const parseSandboxPerThreadStrict = () => {
+  const raw = process.env.SANDBOX_PER_THREAD_STRICT
+  if (raw === undefined) return false
+  return raw.toLowerCase() === 'true'
+}
+
+const getSandboxClient = (() => {
+  const cache = new Map<string, SandboxClient>()
+  return (environment: string | null) => {
+    if (!environment) return null
+    const normalized = environment.trim()
+    if (!normalized) return null
+    const existing = cache.get(normalized)
+    if (existing) return existing
+    const shellTimeout = parseSandboxShellTimeoutSeconds()
+    const next = new SandboxClient({
+      environment: normalized,
+      timeoutInSeconds: Math.max(parseSandboxTimeoutSeconds() ?? 0, shellTimeout),
+      headers: parseSandboxHeaders()
+    })
+    cache.set(normalized, next)
+    return next
+  }
+})()
+
+const initializedRemoteSandboxThreads = new Set<string>()
 
 const parseSummaryTriggerMessages = () => {
   const fromConfig = loadAppConfig()?.chat?.summaryTriggerMessages
@@ -338,6 +411,15 @@ type ToolExecutionContext = {
   subagentCallCount?: number
   maxSubagentCalls?: number
   toolErrorRecoveryInjected?: boolean
+  toolResultCache?: Map<
+    string,
+    {
+      ok: boolean
+      modelToolContent: string
+      safeResult?: string
+      safeError?: string
+    }
+  >
 }
 
 type LocalToolHandler = (args: Record<string, unknown>, context?: ToolExecutionContext) => Promise<string> | string
@@ -395,7 +477,79 @@ const buildLocalToolset = (threadData: ThreadData, threadId: string) => {
   const tools: OpenAiToolDefinition[] = BUILTIN_TOOL_DEFINITIONS
   const skillsRoot = resolveSkillsPath()
   const skillsContainerPath = getSkillsContainerPath()
-  const sandboxPrefix = '/mnt/user-data'
+  const sandboxPrefix = '/tmp/user-data'
+  // Prefer the per-thread sandbox endpoint when sandbox lifecycle is enabled.
+  const threadSandbox = getThread(threadId)?.sandbox ?? null
+  const sandboxEnvironment = threadSandbox?.apiUrl ?? parseSandboxApiUrl()
+  const sandboxClient = getSandboxClient(sandboxEnvironment)
+  const sandboxPerThread = parseSandboxPerThread()
+  const sandboxPerThreadStrict = parseSandboxPerThreadStrict()
+  const sandboxDataRoot = threadSandbox
+    ? sandboxPrefix
+    : sandboxPerThread
+      ? path.posix.join(sandboxPrefix, threadId)
+      : sandboxPrefix
+  const unwrapSandboxResponse = (response: any) => {
+    const payload = response?.data ?? response
+    if (payload?.ok === false && payload?.error) {
+      const rawResponse = payload?.rawResponse ?? response?.rawResponse
+      const content = payload.error?.content ?? payload.error
+      const statusCode =
+        typeof content?.statusCode === 'number'
+          ? content.statusCode
+          : typeof rawResponse?.status === 'number'
+            ? rawResponse.status
+            : null
+      const url = typeof rawResponse?.url === 'string' ? rawResponse.url : null
+      const statusText = typeof rawResponse?.statusText === 'string' ? rawResponse.statusText : null
+      const rawBody =
+        content?.body !== undefined
+          ? content.body
+          : payload.error?.body !== undefined
+            ? payload.error.body
+            : null
+      const bodyText =
+        typeof rawBody === 'string'
+          ? rawBody.trim()
+          : rawBody
+            ? JSON.stringify(rawBody)
+            : null
+      const explicit =
+        typeof content?.errorMessage === 'string'
+          ? content.errorMessage
+          : typeof content?.message === 'string'
+            ? content.message
+            : typeof payload.error?.message === 'string'
+              ? payload.error.message
+              : typeof payload.error?.errorMessage === 'string'
+                ? payload.error.errorMessage
+                : null
+      const parts = [
+        'Sandbox API error',
+        statusCode ? `HTTP ${statusCode}${statusText ? ` ${statusText}` : ''}` : null,
+        url ? `url=${url}` : null,
+        explicit ? `message=${explicit}` : null,
+        bodyText ? `body=${bodyText.length > 600 ? `${bodyText.slice(0, 600)}…` : bodyText}` : null
+      ].filter(Boolean)
+      const message = parts.join(' | ')
+      throw new Error(message)
+    }
+    const data = payload?.body ?? payload?.data ?? payload
+    if (data?.success === false && typeof data?.message === 'string') {
+      throw new Error(data.message)
+    }
+    return data
+  }
+  const ensureSandboxThreadReady = async () => {
+    if (!sandboxClient) return
+    if (initializedRemoteSandboxThreads.has(threadId)) return
+    if (!threadSandbox && sandboxPerThread) {
+      const command = `mkdir -p ${sandboxDataRoot}`
+      const response = await sandboxClient.shell.execCommand({ command, exec_dir: '/', truncate: true, timeout: 30 })
+      unwrapSandboxResponse(response)
+    }
+    initializedRemoteSandboxThreads.add(threadId)
+  }
   const resolveSandboxPath = (rawPath: string) => {
     if (rawPath.startsWith(skillsContainerPath)) {
       const relative = path.relative(skillsContainerPath, rawPath)
@@ -431,11 +585,67 @@ const buildLocalToolset = (threadData: ThreadData, threadId: string) => {
     if (isWithin(target, threadData.outputsPath)) return
     throw new Error('Path outside sandbox')
   }
+  const isSkillsPath = (rawPath: string) => {
+    return rawPath.trim().startsWith(skillsContainerPath)
+  }
+  const resolveSandboxVirtualPath = (rawPath: string) => {
+    const trimmed = rawPath.trim()
+    if (trimmed.startsWith(sandboxPrefix)) {
+      const relative = trimmed.slice(sandboxPrefix.length).replace(/^\/+/, '')
+      const [subdir, rest] = relative.split('/', 2)
+      if (subdir !== 'workspace' && subdir !== 'uploads' && subdir !== 'outputs') {
+        throw new Error('Invalid sandbox path')
+      }
+      const normalizedRest = (() => {
+        if (!rest) return ''
+        if (!threadSandbox && sandboxPerThread) {
+          return rest.startsWith(`${threadId}/`) ? rest.slice(threadId.length + 1) : rest
+        }
+        return rest
+      })()
+      return normalizedRest ? path.posix.join(sandboxDataRoot, normalizedRest) : sandboxDataRoot
+    }
+    if (path.isAbsolute(trimmed)) {
+      if (isWithin(trimmed, threadData.workspacePath)) {
+        const rel = path.relative(threadData.workspacePath, trimmed)
+        return path.posix.join(sandboxDataRoot, rel)
+      }
+      if (isWithin(trimmed, threadData.uploadsPath)) {
+        const rel = path.relative(threadData.uploadsPath, trimmed)
+        return path.posix.join(sandboxDataRoot, rel)
+      }
+      if (isWithin(trimmed, threadData.outputsPath)) {
+        const rel = path.relative(threadData.outputsPath, trimmed)
+        return path.posix.join(sandboxDataRoot, rel)
+      }
+      if (sandboxPerThreadStrict) {
+        throw new Error('Path outside sandbox')
+      }
+      return trimmed.replaceAll('\\', '/')
+    }
+    return path.posix.join(sandboxDataRoot, trimmed)
+  }
   const localToolMap = new Map<string, LocalToolHandler>()
-  localToolMap.set('read_file', (args) => {
+  localToolMap.set('read_file', async (args) => {
     const rawPath = args?.path
     if (typeof rawPath !== 'string' || rawPath.trim().length === 0) {
       throw new Error('Invalid path')
+    }
+    if (sandboxClient && !isSkillsPath(rawPath)) {
+      await ensureSandboxThreadReady()
+      const sandboxPath = resolveSandboxVirtualPath(rawPath)
+      const response = await sandboxClient.file.readFile({ file: sandboxPath })
+      const result = unwrapSandboxResponse(response)
+      const content =
+        typeof result?.content === 'string'
+          ? result.content
+          : typeof result?.data?.content === 'string'
+            ? result.data.content
+            : null
+      if (typeof content !== 'string') {
+        throw new Error('Invalid sandbox response')
+      }
+      return content.length > 20000 ? `${content.slice(0, 20000)}…` : content
     }
     const targetPath = resolveSandboxPath(rawPath)
     ensureAllowedPath(targetPath)
@@ -445,14 +655,30 @@ const buildLocalToolset = (threadData: ThreadData, threadId: string) => {
     const content = fs.readFileSync(targetPath, 'utf-8')
     return content.length > 20000 ? `${content.slice(0, 20000)}…` : content
   })
-  localToolMap.set('write_file', (args) => {
-    const writeOne = (rawPath: unknown, content: unknown) => {
+  localToolMap.set('write_file', async (args) => {
+    const normalizeArtifactName = (rawPath: string) => {
+      const trimmedRawPath = rawPath.trim()
+      if (!trimmedRawPath) return ''
+      const normalized = trimmedRawPath.replaceAll('\\', '/')
+      const base = normalized.startsWith('/tmp/user-data/') ? normalized.slice('/tmp/user-data/'.length) : normalized
+      const stripped = base.replace(/^\/+/, '')
+      if (!stripped) return ''
+      const [first, rest] = stripped.split('/', 2)
+      const withoutBucket = first === 'workspace' || first === 'uploads' || first === 'outputs' ? rest ?? '' : stripped
+      if (!withoutBucket) return ''
+      if (!threadSandbox && sandboxPerThread && withoutBucket.startsWith(`${threadId}/`)) {
+        return withoutBucket.slice(threadId.length + 1)
+      }
+      return withoutBucket
+    }
+    const writeOneLocal = async (rawPath: unknown, content: unknown) => {
       if (typeof rawPath !== 'string' || rawPath.trim().length === 0) {
         throw new Error('Invalid path')
       }
       if (typeof content !== 'string') {
         throw new Error('Invalid content')
       }
+      const trimmedRawPath = rawPath.trim()
       const targetPath = resolveSandboxPath(rawPath)
       ensureAllowedPath(targetPath)
       const dir = path.dirname(targetPath)
@@ -460,28 +686,71 @@ const buildLocalToolset = (threadData: ThreadData, threadId: string) => {
         fs.mkdirSync(dir, { recursive: true })
       }
       fs.writeFileSync(targetPath, content, 'utf-8')
-      const artifact = saveFileArtifact(threadId, targetPath)
+      const artifactName = trimmedRawPath.startsWith('/tmp/user-data/')
+        ? trimmedRawPath.slice('/tmp/user-data/'.length).replace(/^\/+/, '')
+        : trimmedRawPath.replaceAll('\\', '/').replace(/^\/+/, '')
+      const artifact = saveFileArtifact(threadId, targetPath, artifactName)
       return {
         path: rawPath,
         bytes: Buffer.byteLength(content, 'utf-8'),
         artifact
       }
     }
+    const writeOneRemote = async (rawPath: unknown, content: unknown) => {
+      if (!sandboxClient || typeof rawPath !== 'string' || isSkillsPath(rawPath)) return null
+      if (typeof content !== 'string') throw new Error('Invalid content')
+      await ensureSandboxThreadReady()
+      const sandboxPath = resolveSandboxVirtualPath(rawPath)
+      const parent = path.posix.dirname(sandboxPath)
+      if (parent && parent !== '/' && parent !== '.') {
+        const mkdirResponse = await sandboxClient.shell.execCommand({ command: `mkdir -p ${parent}`, exec_dir: '/', truncate: true, timeout: 30 })
+        unwrapSandboxResponse(mkdirResponse)
+      }
+      const response = await sandboxClient.file.writeFile({ file: sandboxPath, content })
+      unwrapSandboxResponse(response)
+      const artifactName = normalizeArtifactName(rawPath)
+      const bytes = Buffer.byteLength(content, 'utf-8')
+      const artifact = artifactName
+        ? { name: artifactName, size: bytes, url: `/artifacts/${threadId}/${encodeURIComponent(artifactName)}` }
+        : null
+      return { path: rawPath, bytes, artifact }
+    }
+    const writeOne = async (rawPath: unknown, content: unknown) => {
+      const remote = await writeOneRemote(rawPath, content)
+      if (remote) return remote
+      return await writeOneLocal(rawPath, content)
+    }
     if (Array.isArray(args)) {
-      const results = args.map((entry) => writeOne(entry?.path, entry?.content))
+      const results = await Promise.all(args.map((entry) => writeOne(entry?.path, entry?.content)))
       return JSON.stringify({ ok: true, files: results })
     }
     if (Array.isArray(args?.files)) {
-      const results = args.files.map((entry: any) => writeOne(entry?.path, entry?.content))
+      const results = await Promise.all(args.files.map((entry: any) => writeOne(entry?.path, entry?.content)))
       return JSON.stringify({ ok: true, files: results })
     }
-    const result = writeOne(args?.path, args?.content)
+    const result = await writeOne(args?.path, args?.content)
     return JSON.stringify({ ok: true, ...result })
   })
-  localToolMap.set('list_dir', (args) => {
+  localToolMap.set('list_dir', async (args) => {
     const rawPath = args?.path
     if (typeof rawPath !== 'string' || rawPath.trim().length === 0) {
       throw new Error('Invalid path')
+    }
+    if (sandboxClient && !isSkillsPath(rawPath)) {
+      await ensureSandboxThreadReady()
+      const sandboxPath = resolveSandboxVirtualPath(rawPath)
+      const response = await sandboxClient.file.listPath({ path: sandboxPath })
+      const result = unwrapSandboxResponse(response)
+      const files = Array.isArray(result?.files)
+        ? result.files
+        : Array.isArray(result?.data?.files)
+          ? result.data.files
+          : []
+      const output = files.map((entry) => ({
+        name: entry?.name ?? entry?.path ?? '',
+        type: entry?.is_directory ? 'dir' : 'file'
+      }))
+      return JSON.stringify(output)
     }
     const targetPath = resolveSandboxPath(rawPath)
     ensureAllowedPath(targetPath)
@@ -501,7 +770,7 @@ const buildLocalToolset = (threadData: ThreadData, threadId: string) => {
   localToolMap.set('websearch', async (args, context) => {
     return runTavilyWebSearch(args, context?.signal)
   })
-  localToolMap.set('bash', (args) => {
+  localToolMap.set('bash', async (args) => {
     const command = args?.command
     const cwd = args?.cwd
     if (typeof command !== 'string' || command.trim().length === 0) {
@@ -538,6 +807,31 @@ const buildLocalToolset = (threadData: ThreadData, threadId: string) => {
     const normalized = ` ${command.toLowerCase().replace(/\s+/g, ' ').trim()} `
     if (blockedTokens.some((token) => normalized.includes(` ${token} `))) {
       throw new Error('Command is not allowed')
+    }
+    if (sandboxClient) {
+      await ensureSandboxThreadReady()
+      let resolvedCwd = sandboxDataRoot
+      if (typeof cwd === 'string' && cwd.trim().length > 0) {
+        if (isSkillsPath(cwd)) {
+          throw new Error('Invalid cwd')
+        }
+        resolvedCwd = resolveSandboxVirtualPath(cwd)
+      }
+      const response = await sandboxClient.shell.execCommand({
+        command,
+        exec_dir: resolvedCwd,
+        truncate: true,
+        timeout: parseSandboxShellTimeoutSeconds()
+      })
+      const result = unwrapSandboxResponse(response)
+      const commandResult = result?.data ?? result
+      const output = typeof commandResult?.output === 'string' ? commandResult.output : ''
+      const exitCode = typeof commandResult?.exit_code === 'number' ? commandResult.exit_code : 0
+      return JSON.stringify({
+        stdout: output,
+        stderr: '',
+        exit_code: exitCode
+      })
     }
     let resolvedCwd = threadData.workspacePath
     if (typeof cwd === 'string' && cwd.trim().length > 0) {
@@ -825,6 +1119,71 @@ const buildFileArtifacts = (toolTimeline: Array<{ name: string; result?: string 
   return artifacts
 }
 
+const sanitizeArtifactPathSegment = (segment: string) => {
+  return segment.replace(/[^\w.\-]+/g, '_')
+}
+
+const sanitizeArtifactRelativePath = (raw: string) => {
+  const normalized = raw.replaceAll('\\', '/').trim()
+  if (!normalized) return ''
+  const stripped = normalized.replace(/^\/+/, '')
+  const parts = stripped
+    .split('/')
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0 && p !== '.' && p !== '..')
+    .map((p) => sanitizeArtifactPathSegment(p))
+    .filter((p) => p.length > 0)
+  return parts.join('/')
+}
+
+const unwrapSandboxSimple = (response: any) => {
+  const payload = response?.data ?? response
+  if (payload?.ok === false && payload?.error) {
+    const content = payload.error?.content ?? payload.error
+    const message = typeof content?.message === 'string' ? content.message : 'Sandbox API error'
+    throw new Error(message)
+  }
+  const data = payload?.body ?? payload?.data ?? payload
+  if (data?.success === false && typeof data?.message === 'string') {
+    throw new Error(data.message)
+  }
+  return data
+}
+
+const saveTextArtifactForThread = async (threadId: string, fileName: string | undefined, content: string) => {
+  const threadSandbox = getThread(threadId)?.sandbox ?? null
+  const sandboxEnvironment = threadSandbox?.apiUrl ?? parseSandboxApiUrl()
+  const sandboxClient = getSandboxClient(sandboxEnvironment)
+  const sandboxPerThread = parseSandboxPerThread()
+  const sandboxPrefix = '/tmp/user-data'
+  const sandboxDataRoot = threadSandbox
+    ? sandboxPrefix
+    : sandboxPerThread
+      ? path.posix.join(sandboxPrefix, threadId)
+      : sandboxPrefix
+  if (sandboxClient) {
+    if (!threadSandbox && sandboxPerThread && !initializedRemoteSandboxThreads.has(threadId)) {
+      const response = await sandboxClient.shell.execCommand({ command: `mkdir -p ${sandboxDataRoot}`, exec_dir: '/', truncate: true, timeout: 30 })
+      unwrapSandboxSimple(response)
+      initializedRemoteSandboxThreads.add(threadId)
+    }
+    const rawName = fileName && fileName.trim() ? fileName.trim() : `response-${Date.now()}`
+    const sanitized = sanitizeArtifactRelativePath(rawName)
+    const safeName = path.extname(sanitized) ? sanitized : `${sanitized}.md`
+    const target = path.posix.join(sandboxDataRoot, ...safeName.split('/'))
+    const parent = path.posix.dirname(target)
+    if (parent && parent !== '/' && parent !== '.') {
+      const mkdirResponse = await sandboxClient.shell.execCommand({ command: `mkdir -p ${parent}`, exec_dir: '/', truncate: true, timeout: 30 })
+      unwrapSandboxSimple(mkdirResponse)
+    }
+    const response = await sandboxClient.file.writeFile({ file: target, content })
+    unwrapSandboxSimple(response)
+    const size = Buffer.byteLength(content, 'utf-8')
+    return { name: safeName, size, url: `/artifacts/${threadId}/${encodeURIComponent(safeName)}` }
+  }
+  return saveTextArtifact(threadId, fileName, content)
+}
+
 const stringifyToolResult = (value: unknown) => {
   if (typeof value === 'string') return value
   if (value === null || value === undefined) return ''
@@ -960,6 +1319,17 @@ const executeMcpToolCalls = async (
   onToolEvent?: (event: 'tool_start' | 'tool_end', data: Record<string, unknown>) => void,
   context?: ToolExecutionContext
 ) => {
+  const stableStringify = (value: unknown): string => {
+    if (value === null || value === undefined) return JSON.stringify(value)
+    const t = typeof value
+    if (t === 'string' || t === 'number' || t === 'boolean') return JSON.stringify(value)
+    if (Array.isArray(value)) return `[${value.map((v) => stableStringify(v)).join(',')}]`
+    if (t !== 'object') return JSON.stringify(String(value))
+    const obj = value as Record<string, unknown>
+    const keys = Object.keys(obj).sort()
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(',')}}`
+  }
+
   const toolMessages: OpenAiMessage[] = []
   const toolNames: string[] = []
   let hadError = false
@@ -979,6 +1349,26 @@ const executeMcpToolCalls = async (
     const args = sanitizeToolArgs(parseToolArguments(call.arguments))
     const entry = toolset.toolMap.get(call.name)
     const toolStart = Date.now()
+    const cache = context
+      ? (context.toolResultCache ?? (context.toolResultCache = new Map<string, any>()))
+      : null
+    const cacheKey = `${call.name}|${stableStringify(args)}`
+    const cached = cache?.get(cacheKey) as
+      | { ok: boolean; modelToolContent: string; safeResult?: string; safeError?: string }
+      | undefined
+    if (cached) {
+      toolMessages.push({
+        role: 'tool',
+        content: cached.modelToolContent,
+        tool_call_id: call.id
+      })
+      if (cached.ok) {
+        toolNames.push(call.name)
+      } else {
+        hadError = true
+      }
+      continue
+    }
     onToolEvent?.('tool_start', {
       callId: call.id,
       name: call.name,
@@ -1004,17 +1394,28 @@ const executeMcpToolCalls = async (
         ok: true,
         result: safe
       })
+      cache?.set(cacheKey, {
+        ok: true,
+        modelToolContent: formatToolResultForModel(call.name, result),
+        safeResult: safe
+      })
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error'
       ok = false
       hadError = true
       result = { error: message }
+      const safeError = truncateToolText(sanitizeToolText(message))
       onToolEvent?.('tool_end', {
         callId: call.id,
         name: call.name,
         durationMs: Date.now() - toolStart,
         ok: false,
-        error: truncateToolText(sanitizeToolText(message))
+        error: safeError
+      })
+      cache?.set(cacheKey, {
+        ok: false,
+        modelToolContent: truncateTextHeadTail(sanitizeToolText(stringifyToolResult(result)), 4000, 2800, 900),
+        safeError
       })
     }
     const modelToolContent = ok
@@ -2169,11 +2570,7 @@ const streamOpenAiWithMcp = async (
       toolPayload,
       onChunk,
       context?.onUsage,
-      context?.send
-        ? (data) => {
-            context.send?.('tool_call_delta', data)
-          }
-        : undefined
+      undefined
     )
     collectedTools.push(...(step.tools ?? []))
     if (!step.toolCalls.length) {
@@ -3062,9 +3459,18 @@ chatRoute.post('/stream', async (c) => {
   // 解析模型与线程
   const modelId = body.modelId
   const incomingThreadId = body.threadId
-  const thread = incomingThreadId ? getThread(incomingThreadId) : createThread()
+  let thread = incomingThreadId ? getThread(incomingThreadId) : null
+  if (!incomingThreadId) {
+    const newThreadId = randomUUID()
+    const sandbox = isSandboxLifecycleEnabled() ? await createSandboxForThread(newThreadId) : null
+    thread = createThreadWithId(newThreadId, sandbox)
+  }
   if (!thread) {
     return c.json({ error: 'Thread not found', threadId: incomingThreadId }, 404)
+  }
+  if (!thread.sandbox && isSandboxLifecycleEnabled()) {
+    const sandbox = await createSandboxForThread(thread.id)
+    thread = updateThreadSandbox(thread.id, sandbox) ?? thread
   }
   const model = modelId ? findModelConfig(modelId) : resolveDefaultModel()
   if (!model) {
@@ -3314,15 +3720,32 @@ chatRoute.post('/stream', async (c) => {
             const toolName = (data as any)?.toolName
             const args = (data as any)?.args
             if (typeof name === 'string' && name.length > 0) {
-              trace.push({
-                type: 'tool',
-                callId: typeof callId === 'string' ? callId : undefined,
-                name,
-                serverName: typeof serverName === 'string' ? serverName : undefined,
-                toolName: typeof toolName === 'string' ? toolName : undefined,
-                status: 'running',
-                args: typeof args === 'object' && args ? (args as Record<string, unknown>) : undefined
-              })
+              const resolvedCallId = typeof callId === 'string' && callId.length > 0 ? callId : undefined
+              const last = findLastTrace(
+                (item) =>
+                  item.type === 'tool' &&
+                  item.status === 'running' &&
+                  (resolvedCallId ? item.callId === resolvedCallId : item.name === name)
+              )
+              if (last && last.type === 'tool') {
+                last.callId = resolvedCallId ?? last.callId
+                last.name = name
+                if (typeof serverName === 'string' && serverName) last.serverName = serverName
+                if (typeof toolName === 'string' && toolName) last.toolName = toolName
+                if (typeof args === 'object' && args) {
+                  last.args = { ...(last.args ?? {}), ...(args as Record<string, unknown>) }
+                }
+              } else {
+                trace.push({
+                  type: 'tool',
+                  callId: resolvedCallId,
+                  name,
+                  serverName: typeof serverName === 'string' ? serverName : undefined,
+                  toolName: typeof toolName === 'string' ? toolName : undefined,
+                  status: 'running',
+                  args: typeof args === 'object' && args ? (args as Record<string, unknown>) : undefined
+                })
+              }
             }
           }
           if (event === 'tool_call_delta') {
@@ -3344,7 +3767,17 @@ chatRoute.post('/stream', async (c) => {
                 (resolvedCallId ? item.callId === resolvedCallId : item.name === resolvedName)
             )
             const nextArgs =
-              typeof argsPreview === 'string' && argsPreview.length > 0 ? ({ arguments: argsPreview } as Record<string, unknown>) : undefined
+              typeof argsPreview === 'string' && argsPreview.length > 0
+                ? (() => {
+                    try {
+                      const parsed = JSON.parse(argsPreview) as unknown
+                      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>
+                      return { arguments: argsPreview } as Record<string, unknown>
+                    } catch {
+                      return { arguments: argsPreview } as Record<string, unknown>
+                    }
+                  })()
+                : undefined
             if (last && last.type === 'tool') {
               last.callId = resolvedCallId ?? last.callId
               last.name = resolvedName
@@ -3490,6 +3923,9 @@ chatRoute.post('/stream', async (c) => {
           if (thread.summary) {
             systemTextParts.push(`Conversation summary:\n${thread.summary}`)
           }
+          systemTextParts.push(
+            'Tool use rule: never call the same tool more than once with identical arguments in a single request. Reuse the previous tool result.'
+          )
           const systemText = systemTextParts.length > 0 ? systemTextParts.join('\n\n') : undefined
 
           // 构建上下文与模式开关
@@ -3520,6 +3956,7 @@ chatRoute.post('/stream', async (c) => {
             result?: string
             error?: string
           }> = []
+          const streamedArtifactUrls = new Set<string>()
 
           const updateToolTimeline = (event: 'tool_start' | 'tool_end', data: Record<string, unknown>) => {
             const callId = typeof data.callId === 'string' ? data.callId : undefined
@@ -3563,6 +4000,18 @@ chatRoute.post('/stream', async (c) => {
           const onToolEvent = (event: 'tool_start' | 'tool_end', data: Record<string, unknown>) => {
             updateToolTimeline(event, data)
             send(event, data)
+            if (event !== 'tool_end') return
+            const name = typeof data.name === 'string' ? data.name : ''
+            if (name !== 'write_file') return
+            if (data.ok === false) return
+            const result = typeof data.result === 'string' ? data.result : ''
+            if (!result) return
+            const artifacts = buildFileArtifacts([{ name, result }])
+            if (!artifacts.length) return
+            const next = artifacts.filter((artifact) => !streamedArtifactUrls.has(artifact.url))
+            if (!next.length) return
+            next.forEach((artifact) => streamedArtifactUrls.add(artifact.url))
+            send('artifact', { artifacts: next })
           }
           const toolContext: ToolExecutionContext = {
             model,
@@ -3936,7 +4385,7 @@ chatRoute.post('/stream', async (c) => {
           // 持久化产物与助手消息
           const toolArtifacts = toolTimeline.length > 0 ? buildFileArtifacts(toolTimeline) : []
           const artifacts = (artifactCommand
-            ? [saveTextArtifact(thread.id, artifactCommand.fileName, finalResponse)]
+            ? [await saveTextArtifactForThread(thread.id, artifactCommand.fileName, finalResponse)]
             : []
           ).concat(toolArtifacts)
           const skillReads = toolTimeline.length > 0 ? buildSkillReads(toolTimeline) : []
@@ -3949,7 +4398,7 @@ chatRoute.post('/stream', async (c) => {
               skills:
                 (activeSkillId ? [activeSkillId] : []).concat(skillReads.map((item) => item.name)).filter(Boolean),
               skillReads: skillReads.length > 0 ? skillReads : undefined,
-              tools,
+              tools: Array.from(new Set(tools)).filter(Boolean),
               agents: agents.length > 0 ? agents : undefined,
               agentTimeline: agentTimeline.length > 0 ? agentTimeline : undefined,
               toolTimeline: toolTimeline.length > 0 ? toolTimeline : undefined,
@@ -4000,9 +4449,18 @@ chatRoute.post('/', async (c) => {
     let message = skillCommand ? (skillCommand.content || `使用技能 ${skillCommand.skillId}`) : rawMessageWithoutCompact
     const modelId = body.modelId
     const incomingThreadId = body.threadId
-    const thread = incomingThreadId ? getThread(incomingThreadId) : createThread()
+    let thread = incomingThreadId ? getThread(incomingThreadId) : null
+    if (!incomingThreadId) {
+      const newThreadId = randomUUID()
+      const sandbox = isSandboxLifecycleEnabled() ? await createSandboxForThread(newThreadId) : null
+      thread = createThreadWithId(newThreadId, sandbox)
+    }
     if (!thread) {
       return c.json({ error: 'Thread not found', threadId: incomingThreadId }, 404)
+    }
+    if (!thread.sandbox && isSandboxLifecycleEnabled()) {
+      const sandbox = await createSandboxForThread(thread.id)
+      thread = updateThreadSandbox(thread.id, sandbox) ?? thread
     }
     const model = modelId ? findModelConfig(modelId) : resolveDefaultModel()
 
@@ -4092,6 +4550,9 @@ chatRoute.post('/', async (c) => {
     if (thread.summary) {
       systemTextParts.push(`Conversation summary:\n${thread.summary}`)
     }
+    systemTextParts.push(
+      'Tool use rule: never call the same tool more than once with identical arguments in a single request. Reuse the previous tool result.'
+    )
     const systemText = systemTextParts.length > 0 ? systemTextParts.join('\n\n') : undefined
     const nonSystemMessages = thread.messages.filter((entry) => entry.role !== 'system')
     const contextMaxMessages = parseContextMaxMessages()
@@ -4153,7 +4614,7 @@ chatRoute.post('/', async (c) => {
         return c.json({ error: 'Unsupported model protocol', modelId: model.id }, 400)
       }
       const artifacts = artifactCommand
-        ? [saveTextArtifact(thread.id, artifactCommand.fileName, response)]
+        ? [await saveTextArtifactForThread(thread.id, artifactCommand.fileName, response)]
         : []
       const updated = appendMessage(thread.id, {
         id: randomUUID(),
@@ -4161,7 +4622,7 @@ chatRoute.post('/', async (c) => {
         content: response,
         meta: {
           skills: activeSkillId ? [activeSkillId] : [],
-          tools: tools.length > 0 ? tools : undefined,
+          tools: tools.length > 0 ? Array.from(new Set(tools)) : undefined,
           artifacts: artifacts.length > 0 ? artifacts : undefined,
           tokenUsage: tokenUsage.totalTokens > 0 ? tokenUsage : undefined
         },
@@ -4293,7 +4754,7 @@ chatRoute.post('/', async (c) => {
         ? await generateThinkingSummary(model, message, reporter.content, onUsage).catch(() => null)
         : null
       const artifacts = artifactCommand
-        ? [saveTextArtifact(thread.id, artifactCommand.fileName, reporter.content)]
+        ? [await saveTextArtifactForThread(thread.id, artifactCommand.fileName, reporter.content)]
         : []
       const updated = appendMessage(thread.id, {
         id: randomUUID(),
@@ -4380,7 +4841,7 @@ chatRoute.post('/', async (c) => {
         ? await generateThinkingSummary(model, message, reporter.content, onUsage).catch(() => null)
         : null
       const artifacts = artifactCommand
-        ? [saveTextArtifact(thread.id, artifactCommand.fileName, reporter.content)]
+        ? [await saveTextArtifactForThread(thread.id, artifactCommand.fileName, reporter.content)]
         : []
       const updated = appendMessage(thread.id, {
         id: randomUUID(),
@@ -4449,7 +4910,7 @@ chatRoute.post('/', async (c) => {
         ? await generateThinkingSummary(model, message, response, onUsage).catch(() => null)
         : null
       const artifacts = artifactCommand
-        ? [saveTextArtifact(thread.id, artifactCommand.fileName, response)]
+        ? [await saveTextArtifactForThread(thread.id, artifactCommand.fileName, response)]
         : []
       const updated = appendMessage(thread.id, {
         id: randomUUID(),
@@ -4458,7 +4919,7 @@ chatRoute.post('/', async (c) => {
         meta: {
           thinking: thinkingSummary,
           skills: activeSkillId ? [activeSkillId] : [],
-          tools: metaResponse.tools,
+          tools: Array.from(new Set(metaResponse.tools ?? [])),
           agents: planForPrompt ? [{ name: 'planner', output: planForPrompt }] : undefined,
           artifacts: artifacts.length > 0 ? artifacts : undefined,
           tokenUsage: tokenUsage.totalTokens > 0 ? tokenUsage : undefined
@@ -4516,7 +4977,7 @@ chatRoute.post('/', async (c) => {
         ? await generateThinkingSummary(model, message, response, onUsage).catch(() => null)
         : null
       const artifacts = artifactCommand
-        ? [saveTextArtifact(thread.id, artifactCommand.fileName, response)]
+        ? [await saveTextArtifactForThread(thread.id, artifactCommand.fileName, response)]
         : []
       const updated = appendMessage(thread.id, {
         id: randomUUID(),
@@ -4561,5 +5022,6 @@ export const __test__ = {
   resolveModeFlags,
   getThinkingRequestExtras,
   normalizeSubagentType,
-  buildFlashToolset: (threadId: string) => buildFlashToolset(ensureThreadData(threadId), threadId)
+  buildFlashToolset: (threadId: string) => buildFlashToolset(ensureThreadData(threadId), threadId),
+  executeMcpToolCalls
 }

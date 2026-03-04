@@ -10,13 +10,13 @@ export const BASH_SUBAGENT: SubagentConfig = {
 - 逐条执行有依赖关系的命令；互不依赖的命令可以合并执行
 - 任何文件读写都限定在沙箱目录内，不要尝试访问沙箱外路径
 - 避免破坏性操作（删除、覆盖、清空目录等），除非任务明确要求且你已说明风险
-- 遇到长输出：不要把整段原样粘贴到回复里；写入 /mnt/user-data/outputs 并返回路径
+- 遇到长输出：不要把整段原样粘贴到回复里；写入 /tmp/user-data/outputs 并返回路径
 - 回复中避免超长单行文本；必要时主动换行或用多行形式表达
 
 可用目录：
-- 用户工作区：/mnt/user-data/workspace
-- 上传目录：/mnt/user-data/uploads
-- 输出目录：/mnt/user-data/outputs
+- 用户工作区：/tmp/user-data/workspace
+- 上传目录：/tmp/user-data/uploads
+- 输出目录：/tmp/user-data/outputs
 
 输出格式：
 1. 执行了什么（命令 + 工作目录）

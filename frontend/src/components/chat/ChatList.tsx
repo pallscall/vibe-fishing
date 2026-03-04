@@ -20,6 +20,40 @@ const truncateText = (value: string, maxChars = 320) => {
   return `${value.slice(0, maxChars)}…`;
 };
 
+const CodeBlock = ({ code, language }: { code: string; language?: string }) => {
+  const [copied, setCopied] = React.useState(false);
+  React.useEffect(() => {
+    if (!copied) return;
+    const timeout = setTimeout(() => setCopied(false), 1200);
+    return () => clearTimeout(timeout);
+  }, [copied]);
+  return (
+    <div className="my-2 rounded-xl border border-zinc-200/70 dark:border-zinc-800/70 bg-zinc-950 dark:bg-zinc-950 overflow-hidden">
+      <div className="flex items-center justify-between gap-3 px-3 py-2 border-b border-white/10">
+        <span className="text-[10px] uppercase tracking-[0.24em] text-zinc-400">{language ? language : 'code'}</span>
+        <button
+          type="button"
+          onClick={async () => {
+            try {
+              await navigator.clipboard.writeText(code);
+              setCopied(true);
+            } catch {
+              setCopied(false);
+            }
+          }}
+          className="inline-flex items-center gap-1 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-[11px] text-zinc-300 hover:bg-white/10"
+          aria-label="复制代码"
+        >
+          {copied ? 'Copied' : 'Copy'}
+        </button>
+      </div>
+      <pre className="overflow-x-auto p-3 text-[12px] leading-relaxed text-zinc-100">
+        <code className="whitespace-pre">{code}</code>
+      </pre>
+    </div>
+  );
+};
+
 export function ChatList({ messages, isLoading, streamingMessage, isSidePanelOpen, mode }: ChatListProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -656,10 +690,27 @@ export function ChatList({ messages, isLoading, streamingMessage, isSidePanelOpe
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm]}
                     components={{
-                      p: ({node, ...props}) => <p className="mb-2 last:mb-0 leading-relaxed" {...props} />,
-                      a: ({node, ...props}) => <a className="text-blue-500 hover:underline" target="_blank" rel="noopener noreferrer" {...props} />,
-                      code: ({node, ...props}) => <code className="bg-black/10 dark:bg-white/10 rounded px-1 py-0.5 font-mono text-xs" {...props} />,
-                      pre: ({node, ...props}) => <pre className="bg-zinc-950 dark:bg-zinc-900 p-3 rounded-lg overflow-x-auto my-2 border border-zinc-800" {...props} />
+                      p: ({ node, ...props }) => <p className="mb-3 last:mb-0 leading-relaxed" {...props} />,
+                      a: ({ node, ...props }) => (
+                        <a className="text-blue-600 dark:text-blue-400 hover:underline" target="_blank" rel="noopener noreferrer" {...props} />
+                      ),
+                      code: ({ node, className, children, ...props }: any) => {
+                        const raw = String(children ?? '');
+                        const match = /language-(\w+)/.exec(className ?? '');
+                        const isInline = !match && !raw.includes('\n');
+                        if (isInline) {
+                          return (
+                            <code
+                              className="rounded bg-black/5 dark:bg-white/10 px-1 py-0.5 font-mono text-[12px] text-zinc-800 dark:text-zinc-100 break-words"
+                              {...props}
+                            >
+                              {raw}
+                            </code>
+                          );
+                        }
+                        return <CodeBlock code={raw.replace(/\n$/, '')} language={match?.[1]} />;
+                      },
+                      pre: ({ children }) => <>{children}</>
                     }}
                   >
                     {streamingMessage.content}

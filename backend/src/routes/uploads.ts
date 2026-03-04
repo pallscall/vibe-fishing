@@ -38,7 +38,7 @@ uploadsRoute.get('/:threadId', (c) => {
     .map((entry) => ({
       name: entry.name,
       path: path.join(uploadsPath, entry.name),
-      virtual_path: `/mnt/user-data/uploads/${entry.name}`,
+      virtual_path: `/tmp/user-data/uploads/${entry.name}`,
       url: `/uploads/${threadId}/${encodeURIComponent(entry.name)}`
     }))
   return c.json({ files })
@@ -83,7 +83,7 @@ const handleUpload = async (c: any, threadId: string) => {
       name: safeName,
       size: buffer.length,
       path: filePath,
-      virtual_path: `/mnt/user-data/uploads/${safeName}`,
+      virtual_path: `/tmp/user-data/uploads/${safeName}`,
       url: `/uploads/${threadId}/${encodeURIComponent(safeName)}`
     })
   }

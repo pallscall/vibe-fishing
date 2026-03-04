@@ -14,14 +14,23 @@ const ensureDir = (dir: string) => {
   }
 }
 
+const shouldAvoidLocalUserData = () => {
+  const lifecycle = process.env.SANDBOX_PER_THREAD_LIFECYCLE
+  if (lifecycle && lifecycle.toLowerCase() === 'true') return true
+  const apiUrl = process.env.SANDBOX_API_URL ?? process.env.SANDBOX_API_ENVIRONMENT
+  return Boolean(apiUrl && apiUrl.trim().length > 0)
+}
+
 export const ensureThreadData = (threadId: string): ThreadData => {
   const rootPath = path.resolve(process.cwd(), 'storage', 'threads', threadId, 'user-data')
   const workspacePath = path.join(rootPath, 'workspace')
   const uploadsPath = path.join(rootPath, 'uploads')
   const outputsPath = path.join(rootPath, 'outputs')
-  ensureDir(workspacePath)
-  ensureDir(uploadsPath)
-  ensureDir(outputsPath)
+  if (!shouldAvoidLocalUserData()) {
+    ensureDir(workspacePath)
+    ensureDir(uploadsPath)
+    ensureDir(outputsPath)
+  }
   return { rootPath, workspacePath, uploadsPath, outputsPath }
 }
 

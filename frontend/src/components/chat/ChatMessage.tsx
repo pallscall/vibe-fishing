@@ -3,7 +3,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { cn } from '@/lib/utils';
 import { Message } from '@/lib/types';
-import { Bot, Check, Copy, Lightbulb, User } from 'lucide-react';
+import { Bot, Check, ChevronDown, Copy, Lightbulb, User } from 'lucide-react';
 import { motion } from 'framer-motion';
 
 interface ChatMessageProps {
@@ -14,6 +14,80 @@ interface ChatMessageProps {
 const truncateText = (value: string, maxChars = 320) => {
   if (value.length <= maxChars) return value;
   return `${value.slice(0, maxChars)}…`;
+};
+
+const CodeBlock = ({ code, language }: { code: string; language?: string }) => {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const timeout = setTimeout(() => setCopied(false), 1200);
+    return () => clearTimeout(timeout);
+  }, [copied]);
+  return (
+    <div className="my-2 rounded-xl border border-zinc-200/70 dark:border-zinc-800/70 bg-zinc-950 dark:bg-zinc-950 overflow-hidden">
+      <div className="flex items-center justify-between gap-3 px-3 py-2 border-b border-white/10">
+        <div className="min-w-0">
+          <span className="text-[10px] uppercase tracking-[0.24em] text-zinc-400">
+            {language ? language : 'code'}
+          </span>
+        </div>
+        <button
+          type="button"
+          onClick={async () => {
+            try {
+              await navigator.clipboard.writeText(code);
+              setCopied(true);
+            } catch {
+              setCopied(false);
+            }
+          }}
+          className="inline-flex items-center gap-1 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-[11px] text-zinc-300 hover:bg-white/10"
+          aria-label="复制代码"
+        >
+          {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+          <span className="hidden sm:inline">{copied ? 'Copied' : 'Copy'}</span>
+        </button>
+      </div>
+      <pre className="overflow-x-auto p-3 text-[12px] leading-relaxed text-zinc-100">
+        <code className="whitespace-pre">{code}</code>
+      </pre>
+    </div>
+  );
+};
+
+const MarkdownContent = ({ children, className }: { children: string; className?: string }) => {
+  return (
+    <div className={cn('prose prose-sm dark:prose-invert max-w-none break-words', className)}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          p: ({ node, ...props }) => <p className="mb-3 last:mb-0 leading-relaxed" {...props} />,
+          a: ({ node, ...props }) => (
+            <a className="text-blue-600 dark:text-blue-400 hover:underline" target="_blank" rel="noopener noreferrer" {...props} />
+          ),
+          code: ({ node, className, children, ...props }: any) => {
+            const raw = String(children ?? '');
+            const match = /language-(\w+)/.exec(className ?? '');
+            const isInline = !match && !raw.includes('\n');
+            if (isInline) {
+              return (
+                <code
+                  className="rounded bg-black/5 dark:bg-white/10 px-1 py-0.5 font-mono text-[12px] text-zinc-800 dark:text-zinc-100 break-words"
+                  {...props}
+                >
+                  {raw}
+                </code>
+              );
+            }
+            return <CodeBlock code={raw.replace(/\n$/, '')} language={match?.[1]} />;
+          },
+          pre: ({ children }) => <>{children}</>
+        }}
+      >
+        {children}
+      </ReactMarkdown>
+    </div>
+  );
 };
 
 export function ChatMessage({ message, mode }: ChatMessageProps) {
@@ -92,6 +166,17 @@ export function ChatMessage({ message, mode }: ChatMessageProps) {
       setCopied(true);
     } catch {
       setCopied(false);
+    }
+  };
+
+  const prettifyJson = (value: string) => {
+    const trimmed = value.trim();
+    if (!trimmed) return '';
+    if (!(trimmed.startsWith('{') || trimmed.startsWith('['))) return value;
+    try {
+      return JSON.stringify(JSON.parse(trimmed), null, 2);
+    } catch {
+      return value;
     }
   };
 
@@ -175,16 +260,19 @@ export function ChatMessage({ message, mode }: ChatMessageProps) {
                       </span>
                     </summary>
                     {item.content && (
-                      <div className={cn('mt-2 whitespace-pre-wrap break-words leading-relaxed', item.phase === 'thinking' ? 'text-[11px] text-zinc-500' : '')}>
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown>
-                      </div>
+                      <MarkdownContent
+                        className={cn('mt-2', item.phase === 'thinking' ? 'text-[11px] text-zinc-500' : 'text-[12px]')}
+                      >
+                        {item.content}
+                      </MarkdownContent>
                     )}
                   </details>
                 );
               }
               const label = item.toolName && item.serverName ? `${item.serverName} / ${item.toolName}` : item.name;
               const argsText = item.args ? (() => { try { return JSON.stringify(item.args, null, 2); } catch { return ''; } })() : '';
-              const resultText = item.error ? item.error : item.result ?? '';
+              const resultTextRaw = item.error ? item.error : item.result ?? '';
+              const resultText = prettifyJson(resultTextRaw);
               const argsPreview = argsText ? truncateText(argsText, 240) : '';
               const resultPreview = resultText ? truncateText(resultText, 320) : '';
               return (
@@ -209,13 +297,19 @@ export function ChatMessage({ message, mode }: ChatMessageProps) {
                       {argsText && (
                         <div>
                           <div className="text-[11px] text-zinc-400 mb-1">Args</div>
-                          <div className="whitespace-pre-wrap break-all">{argsPreview}</div>
+                          <pre className="rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 overflow-x-auto whitespace-pre text-[11px] text-zinc-600 dark:text-zinc-300">
+                            <code className="font-mono">{argsPreview}</code>
+                          </pre>
                           {argsText.length > argsPreview.length && (
-                            <details className="mt-1">
-                              <summary className="cursor-pointer select-none text-[11px] text-zinc-400">展开</summary>
-                              <div className="mt-2 rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 whitespace-pre-wrap break-all">
-                                {argsText}
-                              </div>
+                            <details className="group mt-1">
+                              <summary className="cursor-pointer select-none text-[11px] text-zinc-400 inline-flex items-center gap-1">
+                                <span className="group-open:hidden">展开</span>
+                                <span className="hidden group-open:inline">收起</span>
+                                <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
+                              </summary>
+                              <pre className="mt-2 rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 overflow-x-auto whitespace-pre text-[11px] text-zinc-600 dark:text-zinc-300">
+                                <code className="font-mono">{argsText}</code>
+                              </pre>
                             </details>
                           )}
                         </div>
@@ -225,15 +319,25 @@ export function ChatMessage({ message, mode }: ChatMessageProps) {
                           <div className={`text-[11px] mb-1 ${item.error ? 'text-rose-400' : 'text-zinc-400'}`}>
                             {item.error ? 'Error' : 'Result'}
                           </div>
-                          <div className={`whitespace-pre-wrap break-all ${item.error ? 'text-rose-500' : ''}`}>
-                            {resultPreview}
-                          </div>
+                          <pre className={cn(
+                            'rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 overflow-x-auto whitespace-pre text-[11px]',
+                            item.error ? 'text-rose-500' : 'text-zinc-600 dark:text-zinc-300'
+                          )}>
+                            <code className="font-mono">{resultPreview}</code>
+                          </pre>
                           {resultText.length > resultPreview.length && (
-                            <details className="mt-1">
-                              <summary className="cursor-pointer select-none text-[11px] text-zinc-400">展开</summary>
-                              <div className="mt-2 rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 whitespace-pre-wrap break-all">
-                                {resultText}
-                              </div>
+                            <details className="group mt-1">
+                              <summary className="cursor-pointer select-none text-[11px] text-zinc-400 inline-flex items-center gap-1">
+                                <span className="group-open:hidden">展开</span>
+                                <span className="hidden group-open:inline">收起</span>
+                                <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
+                              </summary>
+                              <pre className={cn(
+                                'mt-2 rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 overflow-x-auto whitespace-pre text-[11px]',
+                                item.error ? 'text-rose-500' : 'text-zinc-600 dark:text-zinc-300'
+                              )}>
+                                <code className="font-mono">{resultText}</code>
+                              </pre>
                             </details>
                           )}
                         </div>
@@ -259,7 +363,8 @@ export function ChatMessage({ message, mode }: ChatMessageProps) {
                     }
                   })()
                 : '';
-              const resultText = tool.error ? tool.error : tool.result ?? '';
+              const resultTextRaw = tool.error ? tool.error : tool.result ?? '';
+              const resultText = prettifyJson(resultTextRaw);
               const argsPreview = argsText ? truncateText(argsText, 240) : '';
               const resultPreview = resultText ? truncateText(resultText, 320) : '';
               return (
@@ -284,13 +389,19 @@ export function ChatMessage({ message, mode }: ChatMessageProps) {
                       {argsText && (
                         <div>
                           <div className="text-[11px] text-zinc-400 mb-1">Args</div>
-                          <div className="whitespace-pre-wrap break-all">{argsPreview}</div>
+                          <pre className="rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 overflow-x-auto whitespace-pre text-[11px] text-zinc-600 dark:text-zinc-300">
+                            <code className="font-mono">{argsPreview}</code>
+                          </pre>
                           {argsText.length > argsPreview.length && (
-                            <details className="mt-1">
-                              <summary className="cursor-pointer select-none text-[11px] text-zinc-400">展开</summary>
-                              <div className="mt-2 rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 whitespace-pre-wrap break-all">
-                                {argsText}
-                              </div>
+                            <details className="group mt-1">
+                              <summary className="cursor-pointer select-none text-[11px] text-zinc-400 inline-flex items-center gap-1">
+                                <span className="group-open:hidden">展开</span>
+                                <span className="hidden group-open:inline">收起</span>
+                                <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
+                              </summary>
+                              <pre className="mt-2 rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 overflow-x-auto whitespace-pre text-[11px] text-zinc-600 dark:text-zinc-300">
+                                <code className="font-mono">{argsText}</code>
+                              </pre>
                             </details>
                           )}
                         </div>
@@ -300,15 +411,25 @@ export function ChatMessage({ message, mode }: ChatMessageProps) {
                           <div className={`text-[11px] mb-1 ${tool.error ? 'text-rose-400' : 'text-zinc-400'}`}>
                             {tool.error ? 'Error' : 'Result'}
                           </div>
-                          <div className={`whitespace-pre-wrap break-all ${tool.error ? 'text-rose-500' : ''}`}>
-                            {resultPreview}
-                          </div>
+                          <pre className={cn(
+                            'rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 overflow-x-auto whitespace-pre text-[11px]',
+                            tool.error ? 'text-rose-500' : 'text-zinc-600 dark:text-zinc-300'
+                          )}>
+                            <code className="font-mono">{resultPreview}</code>
+                          </pre>
                           {resultText.length > resultPreview.length && (
-                            <details className="mt-1">
-                              <summary className="cursor-pointer select-none text-[11px] text-zinc-400">展开</summary>
-                              <div className="mt-2 rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 whitespace-pre-wrap break-all">
-                                {resultText}
-                              </div>
+                            <details className="group mt-1">
+                              <summary className="cursor-pointer select-none text-[11px] text-zinc-400 inline-flex items-center gap-1">
+                                <span className="group-open:hidden">展开</span>
+                                <span className="hidden group-open:inline">收起</span>
+                                <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
+                              </summary>
+                              <pre className={cn(
+                                'mt-2 rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 overflow-x-auto whitespace-pre text-[11px]',
+                                tool.error ? 'text-rose-500' : 'text-zinc-600 dark:text-zinc-300'
+                              )}>
+                                <code className="font-mono">{resultText}</code>
+                              </pre>
                             </details>
                           )}
                         </div>
@@ -388,23 +509,23 @@ export function ChatMessage({ message, mode }: ChatMessageProps) {
                             </div>
                           </div>
                           {agent.thinking && (
-                            <details className="mt-2">
-                              <summary className="cursor-pointer select-none text-[11px] text-zinc-400">思考</summary>
+                            <details className="group mt-2">
+                              <summary className="cursor-pointer select-none text-[11px] text-zinc-400 inline-flex items-center gap-1">
+                                思考
+                                <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
+                              </summary>
                               <div className="mt-2 rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 whitespace-pre-wrap break-words text-[11px] text-zinc-500">
-                                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                                  {agent.thinking}
-                                </ReactMarkdown>
+                                <MarkdownContent className="text-[11px] text-zinc-500">{agent.thinking}</MarkdownContent>
                               </div>
                             </details>
                           )}
                           {agent.output && (
-                            <details className="mt-2">
-                              <summary className="cursor-pointer select-none text-[11px] text-zinc-400">输出</summary>
-                              <div className="mt-2 whitespace-pre-wrap break-words leading-relaxed">
-                                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                                  {agent.output}
-                                </ReactMarkdown>
-                              </div>
+                            <details className="group mt-2">
+                              <summary className="cursor-pointer select-none text-[11px] text-zinc-400 inline-flex items-center gap-1">
+                                输出
+                                <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
+                              </summary>
+                              <MarkdownContent className="mt-2">{agent.output}</MarkdownContent>
                             </details>
                           )}
                         </div>
@@ -418,26 +539,7 @@ export function ChatMessage({ message, mode }: ChatMessageProps) {
         {hasSections && displayedContent && (
           <div className="h-4" />
         )}
-          <div className="prose prose-sm dark:prose-invert max-w-none break-words">
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              components={{
-                p: ({node, ...props}) => <p className="mb-2 last:mb-0 leading-relaxed" {...props} />,
-                a: ({node, ...props}) => <a className="text-blue-500 hover:underline" target="_blank" rel="noopener noreferrer" {...props} />,
-                code: ({node, ...props}) => (
-                  <code className="bg-black/10 dark:bg-white/10 rounded px-1 py-0.5 font-mono text-xs break-all" {...props} />
-                ),
-                pre: ({node, ...props}) => (
-                  <pre
-                    className="bg-zinc-950 dark:bg-zinc-900 p-3 rounded-lg overflow-x-hidden my-2 border border-zinc-800 whitespace-pre-wrap break-all"
-                    {...props}
-                  />
-                )
-              }}
-            >
-              {displayedContent}
-            </ReactMarkdown>
-          </div>
+        <MarkdownContent>{displayedContent}</MarkdownContent>
         </div>
         <button
           type="button"

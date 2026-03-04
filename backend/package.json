@@ -6,6 +6,7 @@
     "start": "tsx src/index.ts"
   },
   "dependencies": {
+    "@agent-infra/sandbox": "^1.0.10",
     "@langchain/langgraph": "^0.2.34",
     "@hono/node-server": "^1.13.7",
     "archiver": "^7.0.1",

@@ -43,11 +43,11 @@ When a user requests presentation generation, identify:
 - **Style**: business / academic / minimal / keynote / creative
 - Aspect ratio: Standard (16:9) or classic (4:3)
 - Content outline: Key points for each slide
-- You don't need to check the folder under `/mnt/user-data`
+- You don't need to check the folder under `/tmp/user-data`
 
 ### Step 2: Create Presentation Plan
 
-Create a JSON file in `/mnt/user-data/workspace/` with the presentation structure. **Important**: Include the `style` field to define the overall visual consistency.
+Create a JSON file in `/tmp/user-data/workspace/` with the presentation structure. **Important**: Include the `style` field to define the overall visual consistency.
 
 ```json
 {
@@ -99,8 +99,8 @@ Create a JSON file in `/mnt/user-data/workspace/` with the presentation structur
 
 ```bash
 python /mnt/skills/public/image-generation/scripts/generate.py \
-  --prompt-file /mnt/user-data/workspace/slide-01-prompt.json \
-  --output-file /mnt/user-data/outputs/slide-01.jpg \
+  --prompt-file /tmp/user-data/workspace/slide-01-prompt.json \
+  --output-file /tmp/user-data/outputs/slide-01.jpg \
   --aspect-ratio 16:9
 ```
 
@@ -118,9 +118,9 @@ python /mnt/skills/public/image-generation/scripts/generate.py \
 
 ```bash
 python /mnt/skills/public/image-generation/scripts/generate.py \
-  --prompt-file /mnt/user-data/workspace/slide-02-prompt.json \
-  --reference-images /mnt/user-data/outputs/slide-01.jpg \
-  --output-file /mnt/user-data/outputs/slide-02.jpg \
+  --prompt-file /tmp/user-data/workspace/slide-02-prompt.json \
+  --reference-images /tmp/user-data/outputs/slide-01.jpg \
+  --output-file /tmp/user-data/outputs/slide-02.jpg \
   --aspect-ratio 16:9
 ```
 
@@ -129,16 +129,16 @@ python /mnt/skills/public/image-generation/scripts/generate.py \
 ```bash
 # Slide 3 references slide 2
 python /mnt/skills/public/image-generation/scripts/generate.py \
-  --prompt-file /mnt/user-data/workspace/slide-03-prompt.json \
-  --reference-images /mnt/user-data/outputs/slide-02.jpg \
-  --output-file /mnt/user-data/outputs/slide-03.jpg \
+  --prompt-file /tmp/user-data/workspace/slide-03-prompt.json \
+  --reference-images /tmp/user-data/outputs/slide-02.jpg \
+  --output-file /tmp/user-data/outputs/slide-03.jpg \
   --aspect-ratio 16:9
 
 # Slide 4 references slide 3
 python /mnt/skills/public/image-generation/scripts/generate.py \
-  --prompt-file /mnt/user-data/workspace/slide-04-prompt.json \
-  --reference-images /mnt/user-data/outputs/slide-03.jpg \
-  --output-file /mnt/user-data/outputs/slide-04.jpg \
+  --prompt-file /tmp/user-data/workspace/slide-04-prompt.json \
+  --reference-images /tmp/user-data/outputs/slide-03.jpg \
+  --output-file /tmp/user-data/outputs/slide-04.jpg \
   --aspect-ratio 16:9
 ```
 
@@ -148,9 +148,9 @@ After all slide images are generated, call the composition script:
 
 ```bash
 python /mnt/skills/public/ppt-generation/scripts/generate.py \
-  --plan-file /mnt/user-data/workspace/presentation-plan.json \
-  --slide-images /mnt/user-data/outputs/slide-01.jpg /mnt/user-data/outputs/slide-02.jpg /mnt/user-data/outputs/slide-03.jpg \
-  --output-file /mnt/user-data/outputs/presentation.pptx
+  --plan-file /tmp/user-data/workspace/presentation-plan.json \
+  --slide-images /tmp/user-data/outputs/slide-01.jpg /tmp/user-data/outputs/slide-02.jpg /tmp/user-data/outputs/slide-03.jpg \
+  --output-file /tmp/user-data/outputs/presentation.pptx
 ```
 
 Parameters:
@@ -168,7 +168,7 @@ User request: "Create a presentation about AI product launch"
 
 ### Step 1: Create presentation plan
 
-Create `/mnt/user-data/workspace/ai-product-plan.json`:
+Create `/tmp/user-data/workspace/ai-product-plan.json`:
 ```json
 {
   "title": "Introducing Nova AI",
@@ -230,7 +230,7 @@ Read `/mnt/skills/public/image-generation/SKILL.md` to understand how to generat
 
 **Slide 1 - Title (establishes the visual language):**
 
-Create `/mnt/user-data/workspace/nova-slide-01.json`:
+Create `/tmp/user-data/workspace/nova-slide-01.json`:
 ```json
 {
   "prompt": "Ultra-premium presentation title slide with glassmorphism design. Background: smooth flowing gradient from deep purple (#667eea) through magenta (#f093fb) to cyan (#00d4ff), soft and vibrant. Center: large frosted glass panel with strong backdrop blur effect, rounded corners 32px, containing bold white sans-serif title 'Introducing Nova AI' (72pt, SF Pro Display style, font-weight 700) with subtle text shadow, subtitle 'Intelligence, Reimagined' below in lighter weight. The glass panel has subtle white border (1px rgba 255,255,255,0.25) and soft purple-tinted drop shadow. Floating around the card: 3D glass spheres with refraction, translucent geometric shapes (icosahedrons, abstract blobs), creating depth and dimension. Soft luminous glow emanating from behind the glass panel. Small floating particles of light. Apple Vision Pro / visionOS UI aesthetic. Professional presentation slide, 16:9 aspect ratio. Hyper-modern, premium tech product launch feel.",
@@ -244,14 +244,14 @@ Create `/mnt/user-data/workspace/nova-slide-01.json`:
 
 ```bash
 python /mnt/skills/public/image-generation/scripts/generate.py \
-  --prompt-file /mnt/user-data/workspace/nova-slide-01.json \
-  --output-file /mnt/user-data/outputs/nova-slide-01.jpg \
+  --prompt-file /tmp/user-data/workspace/nova-slide-01.json \
+  --output-file /tmp/user-data/outputs/nova-slide-01.jpg \
   --aspect-ratio 16:9
 ```
 
 **Slide 2 - Content (MUST reference slide 1 for consistency):**
 
-Create `/mnt/user-data/workspace/nova-slide-02.json`:
+Create `/tmp/user-data/workspace/nova-slide-02.json`:
 ```json
 {
   "prompt": "Presentation slide continuing EXACT visual style from reference image. SAME purple-to-cyan gradient background, SAME glassmorphism aesthetic, SAME typography style. Left side: frosted glass card with backdrop blur containing title 'Why Nova?' in bold white (matching reference font style), three feature points as subtle glass pill badges below. Right side: abstract 3D neural network visualization made of interconnected glass nodes with soft cyan glow, floating in space. Floating translucent geometric shapes (matching style from reference) adding depth. The frosted glass has identical treatment: white border, purple-tinted shadow, same blur intensity. CRITICAL: This slide must look like it belongs in the exact same presentation as the reference image - same colors, same glass treatment, same overall aesthetic.",
@@ -264,9 +264,9 @@ Create `/mnt/user-data/workspace/nova-slide-02.json`:
 
 ```bash
 python /mnt/skills/public/image-generation/scripts/generate.py \
-  --prompt-file /mnt/user-data/workspace/nova-slide-02.json \
-  --reference-images /mnt/user-data/outputs/nova-slide-01.jpg \
-  --output-file /mnt/user-data/outputs/nova-slide-02.jpg \
+  --prompt-file /tmp/user-data/workspace/nova-slide-02.json \
+  --reference-images /tmp/user-data/outputs/nova-slide-01.jpg \
+  --output-file /tmp/user-data/outputs/nova-slide-02.jpg \
   --aspect-ratio 16:9
 ```
 
@@ -282,9 +282,9 @@ Key consistency rules for subsequent slides:
 
 ```bash
 python /mnt/skills/public/ppt-generation/scripts/generate.py \
-  --plan-file /mnt/user-data/workspace/nova-plan.json \
-  --slide-images /mnt/user-data/outputs/nova-slide-01.jpg /mnt/user-data/outputs/nova-slide-02.jpg /mnt/user-data/outputs/nova-slide-03.jpg /mnt/user-data/outputs/nova-slide-04.jpg /mnt/user-data/outputs/nova-slide-05.jpg \
-  --output-file /mnt/user-data/outputs/nova-presentation.pptx
+  --plan-file /tmp/user-data/workspace/nova-plan.json \
+  --slide-images /tmp/user-data/outputs/nova-slide-01.jpg /tmp/user-data/outputs/nova-slide-02.jpg /tmp/user-data/outputs/nova-slide-03.jpg /tmp/user-data/outputs/nova-slide-04.jpg /tmp/user-data/outputs/nova-slide-05.jpg \
+  --output-file /tmp/user-data/outputs/nova-presentation.pptx
 ```
 
 ## Style-Specific Guidelines
@@ -413,7 +413,7 @@ python /mnt/skills/public/ppt-generation/scripts/generate.py \
 
 After generation:
 
-- The PPTX file is saved in `/mnt/user-data/outputs/`
+- The PPTX file is saved in `/tmp/user-data/outputs/`
 - Share the generated presentation with user using `present_files` tool
 - Also share the individual slide images if requested
 - Provide brief description of the presentation

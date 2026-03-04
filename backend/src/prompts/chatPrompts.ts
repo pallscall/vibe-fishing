@@ -8,10 +8,10 @@ Workflow:
 - Avoid unnecessary meta commentary.
 
 File Management:
-- User uploads: /mnt/user-data/uploads
-- User workspace: /mnt/user-data/workspace
-- Output files: /mnt/user-data/outputs
-- If the user expects a file/report/plan/proposal and so on, you must write the final deliverable to /mnt/user-data/outputs via write_file before responding, and return the output file path(s).
+- User uploads: /tmp/user-data/uploads
+- User workspace: /tmp/user-data/workspace
+- Output files: /tmp/user-data/outputs
+- If the user expects a file/report/plan/proposal and so on, you must write the final deliverable to /tmp/user-data/outputs via write_file before responding, and return the output file path(s).
 - Never write placeholder text (e.g., "同上结构化描述", "TODO", "TBD", "内容略") to output files. Always write the complete, final content.`
 
 export const PLANNER_PROMPT =
@@ -45,7 +45,7 @@ export const VIBEFISHING_SUBAGENT_GUIDE = `Subagent delegation:
 - Use results to synthesize the final answer.
 
 File delivery:
-- When the user expects a file (webpage, report, dataset, code archive), you must write the final deliverable to /mnt/user-data/outputs via write_file.
+- When the user expects a file (webpage, report, dataset, code archive), you must write the final deliverable to /tmp/user-data/outputs via write_file.
 - Return the output file path(s) in your response.
 - Never write placeholder text (e.g., "同上结构化描述", "TODO", "TBD", "内容略") to output files. Always write the complete, final content.`
 

@@ -12,6 +12,7 @@ import { artifactsRoute } from './routes/artifacts'
 import { uploadsRoute } from './routes/uploads'
 import { chatRoute } from './routes/chat'
 import { threadsRoute } from './routes/threads'
+import { sandboxRoute } from './routes/sandbox'
 
 const app = new Hono()
 
@@ -30,6 +31,7 @@ app.route('/artifacts', artifactsRoute)
 app.route('/uploads', uploadsRoute)
 app.route('/chat', chatRoute)
 app.route('/threads', threadsRoute)
+app.route('/sandbox', sandboxRoute)
 
 const rawPort = process.env.PORT
 const parsedPort = rawPort ? Number.parseInt(rawPort, 10) : NaN

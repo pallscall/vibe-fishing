@@ -1,9 +1,11 @@
 node_modules/
-
+.trae/
+.idea/
 .env
+backend/.env
+backend/.env.*
 config.yaml
 
 
 .next/
-frontend/.next/
 backend/storage/

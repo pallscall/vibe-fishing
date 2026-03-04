@@ -1,3 +1,7 @@
+# 注意：Sandbox 相关配置走环境变量（backend/.env），不在 config.yaml 内配置。
+# - 静态/共享 Sandbox：SANDBOX_API_URL / SANDBOX_UI_URL
+# - 按 thread 创建/销毁 Sandbox：SANDBOX_PER_THREAD_LIFECYCLE=true 等（见 backend/.env.example）
+
 chat:
   requestTimeoutMs: 600000
   streamIdleTimeoutMs: 120000

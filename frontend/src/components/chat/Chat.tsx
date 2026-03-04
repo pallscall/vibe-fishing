@@ -7,10 +7,7 @@ import { AgentTimelinePanel } from './AgentTimelinePanel';
 import { ToolTimelinePanel } from './ToolTimelinePanel';
 import { Message, ModelOption, ThreadState } from '@/lib/types';
 import { v4 as uuidv4 } from 'uuid';
-import { Download, Eye, X } from 'lucide-react';
-import Image from 'next/image';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import { Download, Eye, Loader2, X } from 'lucide-react';
 
 interface ChatProps {
   threadId: string | null;
@@ -46,11 +43,11 @@ export function Chat({ threadId }: ChatProps) {
   const [mode, setMode] = useState<ChatMode>('flash');
   const [modelError, setModelError] = useState<string>('');
   const [threadError, setThreadError] = useState<string>('');
+  const [sandboxUiUrl, setSandboxUiUrl] = useState<string>('');
   const [previewOpen, setPreviewOpen] = useState(false);
-  const [selectedPreviewUrl, setSelectedPreviewUrl] = useState<string>('');
-  const [previewText, setPreviewText] = useState<string>('');
-  const [previewLoading, setPreviewLoading] = useState(false);
-  const [previewError, setPreviewError] = useState('');
+  const [downloadBusy, setDownloadBusy] = useState(false);
+  const [downloadError, setDownloadError] = useState('');
+  const [downloadAvailable, setDownloadAvailable] = useState<boolean | null>(null);
   const [agentTimeline, setAgentTimeline] = useState<
     Array<{
       name: string;
@@ -113,6 +110,25 @@ export function Chat({ threadId }: ChatProps) {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    const url = threadId ? `http://localhost:8000/sandbox/info?threadId=${encodeURIComponent(threadId)}` : 'http://localhost:8000/sandbox/info';
+    fetch(url)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!active) return;
+        const ui = typeof data?.uiUrl === 'string' ? data.uiUrl : '';
+        setSandboxUiUrl(ui);
+      })
+      .catch(() => {
+        if (!active) return;
+        setSandboxUiUrl('');
+      });
+    return () => {
+      active = false;
+    };
+  }, [threadId]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -189,40 +205,6 @@ export function Chat({ threadId }: ChatProps) {
     if (!source) return [];
     return source.meta?.toolTimeline ?? [];
   }, [toolTimeline, selectedTimelineMessageId, timelineSourceMessage]);
-  const previewArtifacts = useMemo(() => {
-    const items: Array<{
-      name: string;
-      url: string;
-      type: 'html' | 'markdown' | 'image' | 'video' | 'text' | 'pdf' | 'file';
-    }> = [];
-    for (const message of messages) {
-      const artifacts = message.meta?.artifacts ?? [];
-      for (const artifact of artifacts) {
-        const name = artifact?.name;
-        const url = artifact?.url;
-        if (!name || !url) continue;
-        const lower = name.toLowerCase();
-        let type: 'html' | 'markdown' | 'image' | 'video' | 'text' | 'pdf' | 'file' = 'file';
-        if (lower.endsWith('.html') || lower.endsWith('.htm')) {
-          type = 'html';
-        } else if (lower.endsWith('.md') || lower.endsWith('.markdown')) {
-          type = 'markdown';
-        } else if (lower.match(/\.(png|jpg|jpeg|gif|webp|svg)$/)) {
-          type = 'image';
-        } else if (lower.match(/\.(mp4|webm|ogg)$/)) {
-          type = 'video';
-        } else if (lower.endsWith('.pdf')) {
-          type = 'pdf';
-        } else if (lower.match(/\.(txt|log|csv|json|xml)$/)) {
-          type = 'text';
-        }
-        const fullUrl = url.startsWith('http') ? url : `http://localhost:8000${url}`;
-        if (items.some((item) => item.url === fullUrl)) continue;
-        items.push({ name, url: fullUrl, type });
-      }
-    }
-    return items;
-  }, [messages]);
 
   const timelineOptions = useMemo(() => {
     const options: Array<{ value: string; label: string }> = [];
@@ -237,59 +219,70 @@ export function Chat({ threadId }: ChatProps) {
     });
     return options;
   }, [messages, streamingMessage]);
-  const hasPreviewArtifacts = previewArtifacts.length > 0;
   const hasAnyArtifacts = useMemo(
-    () => messages.some((message) => (message.meta?.artifacts?.length ?? 0) > 0),
-    [messages]
+    () =>
+      messages.some((message) => (message.meta?.artifacts?.length ?? 0) > 0) ||
+      (streamingMessage?.meta?.artifacts?.length ?? 0) > 0,
+    [messages, streamingMessage]
   );
-  const selectedPreview = useMemo(
-    () => previewArtifacts.find((item) => item.url === selectedPreviewUrl) ?? null,
-    [previewArtifacts, selectedPreviewUrl]
-  );
+  const canDownloadArtifacts = (downloadAvailable ?? hasAnyArtifacts) && Boolean(threadId);
+  const sandboxPreviewUrl = useMemo(() => {
+    const normalized = sandboxUiUrl.trim();
+    if (!normalized) return '';
+    const raw = normalized.startsWith('http') ? normalized : `http://${normalized}`;
+    try {
+      const url = new URL(raw);
+      if (!url.searchParams.has('folder')) {
+        url.searchParams.set('folder', '/tmp/user-data');
+      }
+      return url.toString();
+    } catch {
+      return raw;
+    }
+  }, [sandboxUiUrl]);
+
+  const downloadArtifacts = () => {
+    if (!threadId) return;
+    if (downloadBusy) return;
+    setDownloadBusy(true);
+    setDownloadError('');
+    const url = `http://localhost:8000/artifacts/${threadId}/download`;
+    const iframe = document.createElement('iframe');
+    iframe.style.display = 'none';
+    iframe.src = url;
+    document.body.appendChild(iframe);
+    window.setTimeout(() => {
+      iframe.remove();
+    }, 60_000);
+    window.setTimeout(() => {
+      setDownloadBusy(false);
+    }, 600);
+  };
 
   useEffect(() => {
-    if (!previewOpen) return;
-    if (selectedPreviewUrl && previewArtifacts.some((item) => item.url === selectedPreviewUrl)) return;
-    setSelectedPreviewUrl(previewArtifacts[0]?.url ?? '');
-  }, [previewArtifacts, previewOpen, selectedPreviewUrl]);
-
-  useEffect(() => {
-    if (!previewOpen) return;
-    if (!selectedPreview) {
-      setPreviewText('');
-      setPreviewError('');
-      setPreviewLoading(false);
-      return;
-    }
-    if (!(selectedPreview.type === 'markdown' || selectedPreview.type === 'text')) {
-      setPreviewText('');
-      setPreviewError('');
-      setPreviewLoading(false);
-      return;
-    }
     let active = true;
-    setPreviewLoading(true);
-    setPreviewError('');
-    fetch(selectedPreview.url)
-      .then(async (res) => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const text = await res.text();
+    if (!previewOpen || !threadId) {
+      setDownloadAvailable(null);
+      return () => {
+        active = false;
+      };
+    }
+    setDownloadAvailable(null);
+    fetch(`http://localhost:8000/artifacts/${threadId}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
         if (!active) return;
-        setPreviewText(text);
+        const artifacts = Array.isArray((data as any)?.artifacts) ? (data as any).artifacts : [];
+        setDownloadAvailable(artifacts.length > 0);
       })
-      .catch((err) => {
+      .catch(() => {
         if (!active) return;
-        setPreviewError(err instanceof Error ? err.message : 'Preview failed');
-        setPreviewText('');
-      })
-      .finally(() => {
-        if (!active) return;
-        setPreviewLoading(false);
+        setDownloadAvailable(null);
       });
     return () => {
       active = false;
     };
-  }, [previewOpen, selectedPreview]);
+  }, [previewOpen, threadId]);
 
   useEffect(() => {
     let active = true;
@@ -350,6 +343,7 @@ export function Chat({ threadId }: ChatProps) {
     let streamedAnalysis = '';
     let streamedRisk = '';
     let streamedCritic = '';
+    let streamedArtifacts: Array<{ name: string; size: number; url: string }> = [];
     type TraceItem =
       | {
           type: 'agent';
@@ -427,6 +421,7 @@ export function Chat({ threadId }: ChatProps) {
             agentTimeline: agentTimeline.length > 0 ? agentTimeline : undefined,
             toolTimeline: toolTimeline.length > 0 ? toolTimeline : undefined,
             trace: trace.length > 0 ? trace : undefined,
+            artifacts: streamedArtifacts.length > 0 ? streamedArtifacts : undefined,
           },
         },
       ]);
@@ -463,6 +458,33 @@ export function Chat({ threadId }: ChatProps) {
       let isDone = false;
 
       const dispatch = (event: string, data: unknown) => {
+        if (event === 'artifact') {
+          const artifacts = (data as any)?.artifacts;
+          if (!Array.isArray(artifacts) || artifacts.length === 0) return;
+          const normalized = artifacts
+            .map((item: any) => ({
+              name: typeof item?.name === 'string' ? item.name : '',
+              size: typeof item?.size === 'number' ? item.size : 0,
+              url: typeof item?.url === 'string' ? item.url : '',
+            }))
+            .filter((item) => item.name && item.url && item.size >= 0);
+          if (normalized.length === 0) return;
+          streamedArtifacts = [...streamedArtifacts, ...normalized].filter(
+            (item, index, arr) => arr.findIndex((other) => other.url === item.url) === index
+          );
+          setStreamingMessage((prev) => {
+            if (!prev || prev.id !== streamingId) return prev;
+            const existing = prev.meta?.artifacts ?? [];
+            const merged = [...existing, ...normalized].filter(
+              (item, index, arr) => arr.findIndex((other) => other.url === item.url) === index
+            );
+            return {
+              ...prev,
+              meta: { ...(prev.meta ?? {}), artifacts: merged },
+            };
+          });
+          return;
+        }
         if (event === 'tool_call_delta') {
           const index = (data as any)?.index;
           const callId = (data as any)?.id;
@@ -568,7 +590,10 @@ export function Chat({ threadId }: ChatProps) {
             trace = trace.map((item) => {
               if (item.type !== 'tool') return item;
               if (item.status !== 'running') return item;
-              if (resolvedCallId ? item.callId !== resolvedCallId : item.name !== name) return item;
+              const match = resolvedCallId
+                ? item.callId === resolvedCallId || (!item.callId && item.name === name)
+                : item.name === name;
+              if (!match) return item;
               updatedTrace = true;
               return {
                 ...item,
@@ -594,36 +619,42 @@ export function Chat({ threadId }: ChatProps) {
               ];
             }
             setToolTimeline((prev) => {
-              const exists = typeof callId === 'string'
-                ? prev.some((item) => item.callId === callId)
-                : prev.some((item) => item.name === name);
-              const next: ToolTimelineItem[] = exists
-                ? prev.map((item): ToolTimelineItem =>
-                    (typeof callId === 'string' ? item.callId === callId : item.name === name)
-                      ? {
-                          ...item,
-                          callId: typeof callId === 'string' ? callId : item.callId,
-                          status: 'running',
-                          serverName: typeof serverName === 'string' ? serverName : item.serverName,
-                          toolName: typeof toolName === 'string' ? toolName : item.toolName,
-                          args:
-                            typeof args === 'object'
-                              ? ({ ...(item.args ?? {}), ...(args as Record<string, unknown>) } as Record<string, unknown>)
-                              : item.args,
-                        }
-                      : item
-                  )
-                : [
-                    ...prev,
-                    {
-                      callId: typeof callId === 'string' ? callId : undefined,
-                      name,
-                      serverName: typeof serverName === 'string' ? serverName : undefined,
-                      toolName: typeof toolName === 'string' ? toolName : undefined,
-                      status: 'running',
-                      args: typeof args === 'object' ? (args as Record<string, unknown>) : undefined,
-                    },
-                  ];
+              const matchIndex = (() => {
+                if (typeof callId === 'string' && callId.length > 0) {
+                  const byId = prev.findIndex((item) => item.callId === callId);
+                  if (byId >= 0) return byId;
+                  const byNameWithoutId = prev.findIndex((item) => !item.callId && item.status === 'running' && item.name === name);
+                  if (byNameWithoutId >= 0) return byNameWithoutId;
+                  return -1;
+                }
+                return prev.findIndex((item) => item.name === name);
+              })();
+              const nextItem: ToolTimelineItem = {
+                callId: typeof callId === 'string' ? callId : undefined,
+                name,
+                serverName: typeof serverName === 'string' ? serverName : undefined,
+                toolName: typeof toolName === 'string' ? toolName : undefined,
+                status: 'running',
+                args: typeof args === 'object' ? (args as Record<string, unknown>) : undefined,
+              };
+              const next: ToolTimelineItem[] =
+                matchIndex >= 0
+                  ? prev.map((item, idx): ToolTimelineItem =>
+                      idx !== matchIndex
+                        ? item
+                        : {
+                            ...item,
+                            ...nextItem,
+                            callId: nextItem.callId ?? item.callId,
+                            serverName: nextItem.serverName ?? item.serverName,
+                            toolName: nextItem.toolName ?? item.toolName,
+                            args:
+                              typeof args === 'object'
+                                ? ({ ...(item.args ?? {}), ...(args as Record<string, unknown>) } as Record<string, unknown>)
+                                : item.args,
+                          }
+                    )
+                  : [...prev, nextItem];
               setStreamingMessage((prevMessage) => {
                 if (!prevMessage || prevMessage.id !== streamingId) return prevMessage;
                 return {
@@ -656,7 +687,8 @@ export function Chat({ threadId }: ChatProps) {
             trace = trace.map((item) => {
               if (item.type !== 'tool') return item;
               if (item.status !== 'running') return item;
-              if (matchId ? item.callId !== matchId : item.name !== name) return item;
+              const match = matchId ? item.callId === matchId || (!item.callId && item.name === name) : item.name === name;
+              if (!match) return item;
               updated = true;
               return {
                 ...item,
@@ -682,18 +714,41 @@ export function Chat({ threadId }: ChatProps) {
             }
             setToolTimeline((prev) => {
               const status: ToolTimelineItem['status'] = ok === false ? 'error' : 'done';
-              const next: ToolTimelineItem[] = prev.map((item): ToolTimelineItem =>
-                (typeof callId === 'string' ? item.callId === callId : item.name === name)
-                  ? {
-                      ...item,
-                      callId: typeof callId === 'string' ? callId : item.callId,
-                      status,
-                      durationMs: typeof durationMs === 'number' ? durationMs : item.durationMs,
-                      result: typeof result === 'string' ? result : item.result,
-                      error: typeof error === 'string' ? error : item.error,
-                    }
-                  : item
-              );
+              const matchIndex = (() => {
+                if (typeof callId === 'string' && callId.length > 0) {
+                  const byId = prev.findIndex((item) => item.callId === callId);
+                  if (byId >= 0) return byId;
+                  const byNameWithoutId = prev.findIndex((item) => !item.callId && item.status === 'running' && item.name === name);
+                  if (byNameWithoutId >= 0) return byNameWithoutId;
+                  return -1;
+                }
+                return prev.findIndex((item) => item.name === name);
+              })();
+              const next: ToolTimelineItem[] =
+                matchIndex >= 0
+                  ? prev.map((item, idx): ToolTimelineItem =>
+                      idx !== matchIndex
+                        ? item
+                        : {
+                            ...item,
+                            callId: typeof callId === 'string' ? callId : item.callId,
+                            status,
+                            durationMs: typeof durationMs === 'number' ? durationMs : item.durationMs,
+                            result: typeof result === 'string' ? result : item.result,
+                            error: typeof error === 'string' ? error : item.error,
+                          }
+                    )
+                  : [
+                      ...prev,
+                      {
+                        callId: typeof callId === 'string' ? callId : undefined,
+                        name,
+                        status,
+                        durationMs: typeof durationMs === 'number' ? durationMs : undefined,
+                        result: typeof result === 'string' ? result : undefined,
+                        error: typeof error === 'string' ? error : undefined,
+                      },
+                    ];
               const hasRunning = next.some((item) => item.status === 'running');
               setStreamingMessage((prevMessage) => {
                 if (!prevMessage || prevMessage.id !== streamingId) return prevMessage;
@@ -1255,12 +1310,7 @@ export function Chat({ threadId }: ChatProps) {
           <button
             type="button"
             onClick={() => setPreviewOpen(true)}
-            className={`h-9 px-3 rounded-lg border border-zinc-200/70 dark:border-zinc-700/70 text-xs font-medium shadow-sm transition-colors ${
-              hasPreviewArtifacts
-                ? 'bg-white/80 dark:bg-zinc-900/70 text-zinc-700 dark:text-zinc-200 hover:bg-white dark:hover:bg-zinc-800'
-                : 'bg-zinc-100/60 dark:bg-zinc-900/40 text-zinc-400 dark:text-zinc-500 cursor-not-allowed'
-            }`}
-            disabled={!hasPreviewArtifacts}
+            className="h-9 px-3 rounded-lg border border-zinc-200/70 dark:border-zinc-700/70 text-xs font-medium shadow-sm transition-colors bg-white/80 dark:bg-zinc-900/70 text-zinc-700 dark:text-zinc-200 hover:bg-white dark:hover:bg-zinc-800"
           >
             <span className="flex items-center gap-2">
               <Eye className="h-4 w-4" />
@@ -1368,25 +1418,27 @@ export function Chat({ threadId }: ChatProps) {
               onClick={() => setPreviewOpen(false)}
               aria-label="Close preview"
             />
-            <div className="absolute right-0 top-0 h-full w-full max-w-[640px] border-l border-zinc-200/70 dark:border-zinc-800/70 bg-white/95 dark:bg-zinc-950/90 backdrop-blur-xl shadow-2xl flex flex-col">
+            <div className="absolute right-0 top-0 h-full w-full max-w-[920px] border-l border-zinc-200/70 dark:border-zinc-800/70 bg-white/95 dark:bg-zinc-950/90 backdrop-blur-xl shadow-2xl flex flex-col">
               <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-200/70 dark:border-zinc-800/70">
                 <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">预览</div>
                 <div className="flex items-center gap-2">
-                  <a
+                  <button
+                    type="button"
                     className={`h-8 px-2 rounded-lg border border-zinc-200/70 dark:border-zinc-700/70 text-xs font-medium transition-colors flex items-center gap-1 ${
-                      hasAnyArtifacts
+                      canDownloadArtifacts
                         ? 'text-zinc-600 dark:text-zinc-300 hover:text-zinc-800 dark:hover:text-white hover:bg-zinc-100 dark:hover:bg-zinc-800'
                         : 'text-zinc-400 dark:text-zinc-500 cursor-not-allowed'
                     }`}
-                    href={threadId ? `http://localhost:8000/artifacts/${threadId}/download` : undefined}
-                    aria-disabled={!hasAnyArtifacts}
+                    aria-disabled={!canDownloadArtifacts}
                     onClick={(event) => {
-                      if (!hasAnyArtifacts) event.preventDefault();
+                      event.preventDefault();
+                      if (!canDownloadArtifacts || downloadBusy) return;
+                      downloadArtifacts();
                     }}
                   >
-                    <Download className="h-4 w-4" />
+                    {downloadBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
                     下载产物
-                  </a>
+                  </button>
                   <button
                     type="button"
                     className="h-8 w-8 rounded-lg border border-zinc-200/70 dark:border-zinc-700/70 text-zinc-500 dark:text-zinc-300 hover:text-zinc-700 dark:hover:text-white hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
@@ -1396,102 +1448,24 @@ export function Chat({ threadId }: ChatProps) {
                   </button>
                 </div>
               </div>
-              {hasPreviewArtifacts ? (
-                <>
-                  <div className="px-4 py-3 border-b border-zinc-200/60 dark:border-zinc-800/60">
-                    <div className="text-[11px] uppercase tracking-wider text-zinc-400 mb-2">文件</div>
-                    <div className="flex flex-col gap-1">
-                      {previewArtifacts.map((item) => (
-                        <button
-                          key={item.url}
-                          type="button"
-                          onClick={() => setSelectedPreviewUrl(item.url)}
-                          className={`rounded-lg px-2 py-1 text-xs text-left transition-colors ${
-                            selectedPreviewUrl === item.url
-                              ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border border-emerald-500/20'
-                              : 'text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-900'
-                          }`}
-                        >
-                          {item.name}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                  <div className="flex-1 min-h-0">
-                    {!selectedPreview ? (
-                      <div className="h-full flex items-center justify-center text-xs text-zinc-400">
-                        未选择可预览文件
-                      </div>
-                    ) : selectedPreview.type === 'image' ? (
-                      <div className="h-full w-full flex items-center justify-center bg-white dark:bg-zinc-950 p-4">
-                        <div className="relative max-h-full max-w-full w-full h-full">
-                          <Image
-                            src={selectedPreview.url}
-                            alt={selectedPreview.name}
-                            fill
-                            sizes="(max-width: 480px) 100vw, 480px"
-                            className="object-contain rounded-lg"
-                            unoptimized
-                          />
-                        </div>
-                      </div>
-                    ) : selectedPreview.type === 'video' ? (
-                      <video className="w-full h-full bg-black" src={selectedPreview.url} controls />
-                    ) : selectedPreview.type === 'pdf' ? (
-                      <iframe
-                        className="w-full h-full bg-white dark:bg-zinc-950"
-                        src={selectedPreview.url}
-                        title="Artifact Preview"
-                      />
-                    ) : selectedPreview.type === 'markdown' ? (
-                      <div className="h-full overflow-auto bg-white dark:bg-zinc-950 p-4">
-                        {previewLoading ? (
-                          <div className="text-xs text-zinc-400">加载中…</div>
-                        ) : previewError ? (
-                          <div className="text-xs text-rose-500">预览失败：{previewError}</div>
-                        ) : (
-                          <div className="prose prose-sm dark:prose-invert max-w-none">
-                            <ReactMarkdown remarkPlugins={[remarkGfm]}>{previewText}</ReactMarkdown>
-                          </div>
-                        )}
-                      </div>
-                    ) : selectedPreview.type === 'text' ? (
-                      <div className="h-full overflow-auto bg-white dark:bg-zinc-950 p-4">
-                        {previewLoading ? (
-                          <div className="text-xs text-zinc-400">加载中…</div>
-                        ) : previewError ? (
-                          <div className="text-xs text-rose-500">预览失败：{previewError}</div>
-                        ) : (
-                          <pre className="whitespace-pre-wrap break-words text-xs text-zinc-800 dark:text-zinc-200">
-                            {previewText}
-                          </pre>
-                        )}
-                      </div>
-                    ) : selectedPreview.type === 'html' ? (
-                      <iframe
-                        className="w-full h-full bg-white dark:bg-zinc-950"
-                        sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-presentation"
-                        src={selectedPreview.url}
-                        title="Artifact Preview"
-                      />
-                    ) : (
-                      <div className="h-full flex flex-col items-center justify-center gap-2 text-xs text-zinc-400">
-                        <div>暂不支持该格式预览</div>
-                        <a
-                          className="text-emerald-600 dark:text-emerald-400 hover:underline"
-                          href={selectedPreview.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                        >
-                          在新窗口打开
-                        </a>
-                      </div>
-                    )}
-                  </div>
-                </>
+              {downloadError ? (
+                <div className="px-4 py-2 border-b border-zinc-200/70 dark:border-zinc-800/70 text-[11px] text-rose-500">
+                  {downloadError}
+                </div>
+              ) : null}
+              {sandboxPreviewUrl ? (
+                <div className="flex-1 min-h-0">
+                  <iframe
+                    className="w-full h-full bg-white dark:bg-zinc-950"
+                    sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-presentation"
+                    src={sandboxPreviewUrl}
+                    title="Sandbox Preview"
+                  />
+                </div>
               ) : (
-                <div className="flex-1 flex items-center justify-center text-xs text-zinc-400">
-                  暂无可预览文件
+                <div className="flex-1 flex flex-col items-center justify-center gap-2 text-xs text-zinc-400">
+                  <div>未配置 Sandbox UI</div>
+                  <div className="text-[11px] text-zinc-400/80">请设置 SANDBOX_UI_URL 或 SANDBOX_API_URL</div>
                 </div>
               )}
             </div>

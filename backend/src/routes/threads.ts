@@ -1,9 +1,10 @@
 import { Hono } from 'hono'
 import { z } from 'zod'
-import { appendMessage, createThread, deleteThread, getThread, listThreads } from '../store/threads'
+import { appendMessage, createThreadWithId, deleteThread, getThread, listThreads } from '../store/threads'
 import { deleteArtifacts } from '../store/artifacts'
 import { deleteThreadData } from '../sandbox/threadData'
 import { randomUUID } from 'node:crypto'
+import { createSandboxForThread, destroySandboxForThread, isSandboxLifecycleEnabled } from '../sandbox/lifecycle'
 
 export const threadsRoute = new Hono()
 
@@ -23,9 +24,12 @@ threadsRoute.get('/', (c) => {
   }
 })
 
-threadsRoute.post('/', (c) => {
+threadsRoute.post('/', async (c) => {
   try {
-    const thread = createThread()
+    // When sandbox lifecycle is enabled, each thread gets a dedicated sandbox instance.
+    const threadId = randomUUID()
+    const sandbox = isSandboxLifecycleEnabled() ? await createSandboxForThread(threadId) : null
+    const thread = createThreadWithId(threadId, sandbox)
     return c.json(thread)
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error'
@@ -49,9 +53,17 @@ threadsRoute.get('/:threadId', (c) => {
   }
 })
 
-threadsRoute.delete('/:threadId', (c) => {
+threadsRoute.delete('/:threadId', async (c) => {
   try {
     const threadId = c.req.param('threadId')
+    const existing = getThread(threadId)
+    if (!existing) {
+      return c.json({ error: 'Thread not found' }, 404)
+    }
+    // Best-effort cleanup: sandbox destroy should not block local storage cleanup.
+    if (existing.sandbox) {
+      await destroySandboxForThread(existing.sandbox)
+    }
     const deleted = deleteThread(threadId)
     if (!deleted) {
       return c.json({ error: 'Thread not found' }, 404)
