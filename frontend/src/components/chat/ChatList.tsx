@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef } from 'react';
 import { ChatMessage } from './ChatMessage';
 import { Message } from '@/lib/types';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Lightbulb, Sparkles } from 'lucide-react';
+import { Bot, ChevronDown, Lightbulb, Sparkles, Terminal, FileText, Image as ImageIcon, ListTodo, Pencil, Search, LayoutTemplate, Code, Wrench, Globe } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { cn } from '@/lib/utils';
@@ -14,6 +14,176 @@ interface ChatListProps {
   isSidePanelOpen?: boolean;
   mode?: 'flash' | 'thinking' | 'pro' | 'ultra' | 'vibefishing';
 }
+
+const getToolIcon = (name: string) => {
+  const n = name.toLowerCase();
+  if (n.includes('read') || n.includes('file')) return <FileText className="h-3.5 w-3.5" />;
+  if (n.includes('image') || n.includes('photo')) return <ImageIcon className="h-3.5 w-3.5" />;
+  if (n.includes('todo') || n.includes('task')) return <ListTodo className="h-3.5 w-3.5" />;
+  if (n.includes('search') || n.includes('find') || n.includes('query')) return <Search className="h-3.5 w-3.5" />;
+  if (n.includes('skill')) return <LayoutTemplate className="h-3.5 w-3.5" />;
+  if (n.includes('write') || n.includes('create') || n.includes('edit')) return <Pencil className="h-3.5 w-3.5" />;
+  if (n.includes('code') || n.includes('snippet')) return <Code className="h-3.5 w-3.5" />;
+  if (n.includes('web') || n.includes('fetch')) return <Globe className="h-3.5 w-3.5" />;
+  if (n.includes('run') || n.includes('exec') || n.includes('command')) return <Terminal className="h-3.5 w-3.5" />;
+  return <Wrench className="h-3.5 w-3.5" />;
+};
+
+const truncateInline = (value: string, maxChars = 64) => {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, maxChars)}…`;
+};
+
+const getHostname = (rawUrl: string) => {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return '';
+  try {
+    return new URL(trimmed).hostname;
+  } catch {
+    return '';
+  }
+};
+
+function isWebSearchTool(name: string) {
+  const n = name.toLowerCase();
+  return n.includes('web_search') || n.includes('websearch');
+}
+
+function parseWebSearchResult(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed || (!trimmed.startsWith('{') && !trimmed.startsWith('['))) return null;
+  try {
+    const data = JSON.parse(trimmed) as {
+      query?: unknown;
+      answer?: unknown;
+      results?: Array<{
+        title?: unknown;
+        url?: unknown;
+        content?: unknown;
+        score?: unknown;
+      }>;
+    };
+    const results = Array.isArray(data?.results)
+      ? data.results
+          .map((item) => ({
+            title: typeof item?.title === 'string' ? item.title : '',
+            url: typeof item?.url === 'string' ? item.url : '',
+            content: typeof item?.content === 'string' ? item.content : '',
+            score: typeof item?.score === 'number' ? item.score : undefined
+          }))
+          .filter((item) => item.title || item.url || item.content)
+      : [];
+    if (results.length === 0 && typeof data?.answer !== 'string') return null;
+    return {
+      query: typeof data?.query === 'string' ? data.query : '',
+      answer: typeof data?.answer === 'string' ? data.answer : '',
+      results
+    };
+  } catch {
+    return null;
+  }
+}
+
+const getToolSummary = (toolName: string, args: any, resultTextRaw?: string, hasError?: boolean) => {
+  try {
+    const parseIfJson = (value: unknown) => {
+      if (typeof value !== 'string') return value;
+      const trimmed = value.trim();
+      if (!trimmed) return value;
+      if (!(trimmed.startsWith('{') || trimmed.startsWith('['))) return value;
+      try {
+        return JSON.parse(trimmed) as unknown;
+      } catch {
+        return value;
+      }
+    };
+
+    const pickFromObject = (obj: any): string | null => {
+      if (!obj || typeof obj !== 'object') return null;
+      if (typeof obj.file_path === 'string' && obj.file_path) return obj.file_path;
+      if (typeof obj.path === 'string' && obj.path) return obj.path;
+      if (typeof obj.query === 'string' && obj.query) return obj.query;
+      if (typeof obj.query === 'string' && obj.query) return obj.query;
+      if (typeof obj.command === 'string' && obj.command) return obj.command;
+      if (typeof obj.url === 'string' && obj.url) return obj.url;
+      if (typeof obj.name === 'string' && obj.name) return obj.name;
+      if (typeof obj.pattern === 'string' && obj.pattern) return obj.pattern;
+      if (Array.isArray(obj.files) && obj.files.length > 0) {
+        const first = obj.files[0];
+        const firstPath = typeof first?.path === 'string' ? first.path : typeof first?.file_path === 'string' ? first.file_path : '';
+        if (firstPath) return obj.files.length > 1 ? `${firstPath} +${obj.files.length - 1}` : firstPath;
+        return `files(${obj.files.length})`;
+      }
+      if (typeof obj.arguments === 'string' && obj.arguments.trim().length > 0) {
+        const parsed = parseIfJson(obj.arguments);
+        const nested = pickFromObject(parsed as any);
+        if (nested) return nested;
+        const raw = obj.arguments;
+        const m =
+          raw.match(/"file_path"\s*:\s*"([^"]+)"/) ??
+          raw.match(/"path"\s*:\s*"([^"]+)"/) ??
+          raw.match(/"url"\s*:\s*"([^"]+)"/) ??
+          raw.match(/"command"\s*:\s*"([^"]+)"/) ??
+          raw.match(/"query"\s*:\s*"([^"]+)"/);
+        if (m && m[1]) return m[1];
+      }
+      const values = Object.values(obj).filter((v): v is string => typeof v === 'string' && v.trim().length > 0 && v.length <= 80);
+      if (values.length > 0) return values[0]!.trim();
+      return null;
+    };
+
+    if (isWebSearchTool(toolName)) {
+      const parsedArgs = parseIfJson(args);
+      const queryFromArgs = (() => {
+        const fromObject = (obj: unknown): string => {
+          if (!obj || typeof obj !== 'object') return '';
+          const record = obj as Record<string, unknown>;
+          const direct =
+            (typeof record.query === 'string' ? record.query : '') ||
+            (typeof record.q === 'string' ? record.q : '') ||
+            (typeof record.keyword === 'string' ? record.keyword : '') ||
+            (typeof record.search === 'string' ? record.search : '') ||
+            (typeof record.term === 'string' ? record.term : '');
+          if (direct) return direct;
+          if (typeof record.arguments === 'string' && record.arguments.trim().length > 0) {
+            const parsed = parseIfJson(record.arguments);
+            const nested = fromObject(parsed);
+            if (nested) return nested;
+            const raw = record.arguments;
+            const m =
+              raw.match(/"query"\s*:\s*"([^"]+)"/) ??
+              raw.match(/"q"\s*:\s*"([^"]+)"/) ??
+              raw.match(/"keyword"\s*:\s*"([^"]+)"/) ??
+              raw.match(/"search"\s*:\s*"([^"]+)"/);
+            if (m && m[1]) return m[1];
+          }
+          return '';
+        };
+        return fromObject(parsedArgs);
+      })();
+
+      const parsedResult = resultTextRaw ? parseWebSearchResult(resultTextRaw) : null;
+      const query = queryFromArgs || parsedResult?.query || '';
+      const resultsCount = parsedResult?.results?.length ?? 0;
+      const topHost = parsedResult?.results?.[0]?.url ? getHostname(parsedResult.results[0].url) : '';
+      const base = query ? truncateInline(query, 56) : 'websearch';
+      const suffixParts = [
+        resultsCount > 0 ? `${resultsCount} results` : '',
+        topHost ? topHost : '',
+        hasError ? 'error' : ''
+      ].filter(Boolean);
+      return suffixParts.length > 0 ? `${base} · ${suffixParts.join(' · ')}` : base;
+    }
+
+    const a = parseIfJson(args);
+    const summary = pickFromObject(a as any);
+    if (summary) return summary;
+    return null;
+  } catch {
+    return null;
+  }
+};
 
 const truncateText = (value: string, maxChars = 320) => {
   if (value.length <= maxChars) return value;
@@ -51,6 +221,53 @@ const CodeBlock = ({ code, language }: { code: string; language?: string }) => {
         <code className="whitespace-pre">{code}</code>
       </pre>
     </div>
+  );
+};
+
+const formatDuration = (durationMs?: number) => {
+  if (typeof durationMs !== 'number' || !Number.isFinite(durationMs) || durationMs < 0) return '';
+  if (durationMs < 1000) return `${Math.round(durationMs)}ms`;
+  const seconds = durationMs / 1000;
+  return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
+};
+
+const prettifyJson = (value: string) => {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  if (!(trimmed.startsWith('{') || trimmed.startsWith('['))) return value;
+  try {
+    return JSON.stringify(JSON.parse(trimmed), null, 2);
+  } catch {
+    return value;
+  }
+};
+
+const StatusBadge = ({ status }: { status: 'running' | 'done' | 'error' }) => {
+  const config = (() => {
+    if (status === 'running') {
+      return {
+        label: '运行中',
+        className:
+          'border-amber-200/70 dark:border-amber-600/40 bg-amber-50/80 dark:bg-amber-900/20 text-amber-700 dark:text-amber-300'
+      };
+    }
+    if (status === 'error') {
+      return {
+        label: '失败',
+        className:
+          'border-rose-200/70 dark:border-rose-600/40 bg-rose-50/80 dark:bg-rose-900/20 text-rose-700 dark:text-rose-300'
+      };
+    }
+    return {
+      label: '完成',
+      className:
+        'border-emerald-200/70 dark:border-emerald-600/40 bg-emerald-50/80 dark:bg-emerald-900/20 text-emerald-700 dark:text-emerald-300'
+    };
+  })();
+  return (
+    <span className={cn('inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium', config.className)}>
+      {config.label}
+    </span>
   );
 };
 
@@ -195,11 +412,12 @@ export function ChatList({ messages, isLoading, streamingMessage, isSidePanelOpe
                       {trace.map((item, idx) => {
                         if (item.type === 'agent') {
                           const running = item.status === 'running';
-                          const phaseLabel = item.phase === 'thinking' ? 'Thinking' : 'Output';
+                          const phaseLabel = item.phase === 'thinking' ? '思考' : '输出';
+                          const duration = formatDuration(item.durationMs);
                           return (
                             <details
                               key={`${item.type}-${item.agentName}-${item.phase}-${idx}`}
-                              className="w-full rounded-xl border border-zinc-200/70 dark:border-zinc-800/70 bg-white/70 dark:bg-zinc-950/40 px-3 py-2"
+                              className="group w-full rounded-xl border border-zinc-200/70 dark:border-zinc-800/70 bg-white/70 dark:bg-zinc-950/40 px-3 py-2"
                             >
                               <summary
                                 className={cn(
@@ -238,17 +456,19 @@ export function ChatList({ messages, isLoading, streamingMessage, isSidePanelOpe
                                 )}
                                 <div className={cn('flex items-center justify-between gap-3', running ? 'relative z-10' : '')}>
                                   <div className="flex items-center gap-2 min-w-0">
-                                    <span className="inline-flex items-center rounded-full border border-emerald-200/70 dark:border-emerald-700/60 bg-emerald-50/80 dark:bg-emerald-900/20 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-300">
+                                    <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200/70 dark:border-emerald-700/60 bg-emerald-50/80 dark:bg-emerald-900/20 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-300">
+                                      <Bot className="h-3.5 w-3.5" />
                                       Agent
                                     </span>
                                     <span className="font-medium text-zinc-800 dark:text-zinc-100 truncate">
                                       {item.agentName} · {phaseLabel}
                                     </span>
                                   </div>
-                                  <span className="text-[10px] text-zinc-400 shrink-0">
-                                    {item.status}
-                                    {typeof item.durationMs === 'number' ? ` · ${item.durationMs}ms` : ''}
-                                  </span>
+                                  <div className="flex items-center gap-2 shrink-0">
+                                    <StatusBadge status={item.status} />
+                                    {duration ? <span className="text-[10px] text-zinc-400">{duration}</span> : null}
+                                    <ChevronDown className="h-3.5 w-3.5 text-zinc-400 transition-transform group-open:rotate-180" />
+                                  </div>
                                 </div>
                               </summary>
                               {item.content && (
@@ -259,86 +479,98 @@ export function ChatList({ messages, isLoading, streamingMessage, isSidePanelOpe
                             </details>
                           );
                         }
-                        const running = item.status === 'running';
                         const label = item.toolName && item.serverName ? `${item.serverName} / ${item.toolName}` : item.name;
+                        const resultTextRaw = item.error ? item.error : item.result ?? '';
+                        const summary = getToolSummary(item.name, item.args, resultTextRaw, Boolean(item.error));
                         const argsText = item.args ? (() => { try { return JSON.stringify(item.args, null, 2); } catch { return ''; } })() : '';
-                        const resultText = item.error ? item.error : item.result ?? '';
-                        const argsPreview = argsText ? truncateText(argsText, 240) : '';
-                        const resultPreview = resultText ? truncateText(resultText, 320) : '';
+                        const resultText = prettifyJson(resultTextRaw);
+                        const webSearchResult =
+                          !item.error && isWebSearchTool(item.name) ? parseWebSearchResult(resultTextRaw) : null;
+                        const hasWebSearchResults = (webSearchResult?.results?.length ?? 0) > 0;
+                        const duration = formatDuration(item.durationMs);
                         return (
                           <details
                             key={`${item.type}-${item.callId ?? item.name}-${idx}`}
-                            className="w-full rounded-xl border border-zinc-200/70 dark:border-zinc-800/70 bg-white/70 dark:bg-zinc-950/40 px-3 py-2"
+                            className="group/item"
                           >
-                            <summary
-                              className={cn(
-                                'cursor-pointer select-none -mx-2 px-2 py-1 rounded-lg',
-                                running ? 'relative overflow-hidden' : ''
-                              )}
-                            >
-                              {running && (
-                                <span className="pointer-events-none absolute inset-0">
-                                  <span
-                                    className="absolute -inset-12 opacity-55 blur-2xl"
-                                    style={{
-                                      background:
-                                        'conic-gradient(from 180deg at 50% 50%, rgba(16,185,129,.35), rgba(34,211,238,.38), rgba(59,130,246,.18), rgba(16,185,129,.35))',
-                                      animation: 'vf_spin 10s linear infinite'
-                                    }}
-                                  />
-                                  <span className="absolute inset-0 vf-noise opacity-[0.10] mix-blend-overlay" />
-                                  <span
-                                    className="absolute inset-y-0 -left-1/2 w-1/2 opacity-40"
-                                    style={{
-                                      background:
-                                        'linear-gradient(90deg, transparent, rgba(255,255,255,.70), rgba(34,211,238,.25), transparent)',
-                                      animation: 'vf_sweep 2.2s ease-in-out infinite'
-                                    }}
-                                  />
+                            <summary className="flex items-center gap-3 px-2 py-1.5 rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800/50 cursor-pointer select-none">
+                              <div className="flex items-center gap-2 min-w-0 flex-1">
+                                <span className="text-zinc-400">
+                                  {getToolIcon(item.name)}
                                 </span>
-                              )}
-                              <div className={cn('flex items-center justify-between gap-3', running ? 'relative z-10' : '')}>
-                                <div className="flex items-center gap-2 min-w-0">
-                                  <span className="inline-flex items-center rounded-full border border-indigo-200/70 dark:border-indigo-700/60 bg-indigo-50/80 dark:bg-indigo-900/20 px-2 py-0.5 text-[10px] font-medium text-indigo-700 dark:text-indigo-300">
-                                    Tool
+                                <span className="text-xs text-zinc-700 dark:text-zinc-200 truncate font-medium">
+                                  {label}
+                                </span>
+                                {summary && (
+                                  <span className="inline-flex max-w-[200px] truncate rounded-full bg-zinc-100 dark:bg-zinc-800 px-2 py-0.5 text-[10px] text-zinc-500 dark:text-zinc-400">
+                                    {summary}
                                   </span>
-                                  <span className="font-medium text-zinc-800 dark:text-zinc-100 truncate">{label}</span>
-                                </div>
-                                <span className="text-[10px] text-zinc-400 shrink-0">
-                                  {item.status}
-                                  {typeof item.durationMs === 'number' ? ` · ${item.durationMs}ms` : ''}
-                                </span>
+                                )}
+                              </div>
+                              <div className="flex items-center gap-2 shrink-0">
+                                {duration && <span className="text-[10px] text-zinc-400">{duration}</span>}
+                                <StatusBadge status={item.status} />
                               </div>
                             </summary>
                             {(argsText || resultText) && (
-                              <div className="mt-2 space-y-2">
+                              <div className="pl-9 pr-2 pb-2 text-xs space-y-2">
                                 {argsText && (
-                                  <div>
-                                    <div className="text-[10px] text-zinc-400 mb-1">Args</div>
-                                    <div className="whitespace-pre-wrap break-all">{argsPreview}</div>
-                                    {argsText.length > argsPreview.length && (
-                                      <details className="mt-1">
-                                        <summary className="cursor-pointer select-none text-[11px] text-zinc-400">展开</summary>
-                                        <div className="mt-2 rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 whitespace-pre-wrap break-all">
-                                          {argsText}
-                                        </div>
-                                      </details>
-                                    )}
+                                  <div className="bg-zinc-50 dark:bg-zinc-900/50 rounded-lg p-2 border border-zinc-100 dark:border-zinc-800">
+                                    <div className="text-[10px] text-zinc-400 mb-1 font-medium">Args</div>
+                                    <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-[10px] text-zinc-600 dark:text-zinc-300">
+                                      {argsText}
+                                    </pre>
                                   </div>
                                 )}
                                 {resultText && (
-                                  <div>
-                                    <div className={`text-[10px] mb-1 ${item.error ? 'text-rose-400' : 'text-zinc-400'}`}>
+                                  <div className="bg-zinc-50 dark:bg-zinc-900/50 rounded-lg p-2 border border-zinc-100 dark:border-zinc-800">
+                                    <div className={cn("text-[10px] mb-1 font-medium", item.error ? "text-rose-400" : "text-zinc-400")}>
                                       {item.error ? 'Error' : 'Result'}
                                     </div>
-                                    <div className={`whitespace-pre-wrap break-all ${item.error ? 'text-rose-500' : ''}`}>{resultPreview}</div>
-                                    {resultText.length > resultPreview.length && (
-                                      <details className="mt-1">
-                                        <summary className="cursor-pointer select-none text-[11px] text-zinc-400">展开</summary>
-                                        <div className="mt-2 rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 whitespace-pre-wrap break-all">
-                                          {resultText}
+                                    {hasWebSearchResults ? (
+                                      <div className="space-y-2">
+                                        {webSearchResult?.answer && (
+                                          <div className="rounded-md border border-zinc-200/70 dark:border-zinc-800/70 bg-white/70 dark:bg-zinc-950/50 px-2 py-1 text-[10px] text-zinc-600 dark:text-zinc-300">
+                                            {webSearchResult.answer}
+                                          </div>
+                                        )}
+                                        <div className="space-y-2">
+                                          {webSearchResult?.results.map((result, resultIndex) => (
+                                            <a
+                                              key={`${result.url || result.title}-${resultIndex}`}
+                                              href={result.url || '#'}
+                                              target="_blank"
+                                              rel="noopener noreferrer"
+                                              className="block rounded-lg border border-zinc-200/70 dark:border-zinc-800/70 bg-white/80 dark:bg-zinc-950/60 px-2 py-1.5 transition-colors hover:border-zinc-300 dark:hover:border-zinc-700 hover:bg-white dark:hover:bg-zinc-900"
+                                            >
+                                              <div className="flex items-start justify-between gap-2">
+                                                <div className="text-[11px] font-medium text-zinc-700 dark:text-zinc-200">
+                                                  {result.title || result.url || '未命名结果'}
+                                                </div>
+                                                {typeof result.score === 'number' && (
+                                                  <span className="text-[10px] text-zinc-400 shrink-0">
+                                                    {Math.round(result.score * 100)}%
+                                                  </span>
+                                                )}
+                                              </div>
+                                              {result.url && (
+                                                <div className="text-[10px] text-blue-600 dark:text-blue-400 truncate">
+                                                  {result.url}
+                                                </div>
+                                              )}
+                                              {result.content && (
+                                                <div className="text-[10px] text-zinc-500 dark:text-zinc-400 whitespace-pre-wrap">
+                                                  {truncateText(result.content, 220)}
+                                                </div>
+                                              )}
+                                            </a>
+                                          ))}
                                         </div>
-                                      </details>
+                                      </div>
+                                    ) : (
+                                      <pre className={cn("overflow-x-auto whitespace-pre-wrap font-mono text-[10px]", item.error ? "text-rose-500" : "text-zinc-600 dark:text-zinc-300")}>
+                                        {resultText}
+                                      </pre>
                                     )}
                                   </div>
                                 )}
@@ -527,7 +759,11 @@ export function ChatList({ messages, isLoading, streamingMessage, isSidePanelOpe
                                   </div>
                                 </div>
                                 {agent.thinking && (
-                                  <details className="mt-2">
+                                  <details
+                                    key={`${agent.name}-thinking-${agent.thinkingActive ? 'on' : 'off'}`}
+                                    className="mt-2"
+                                    open={agent.thinkingActive ? true : undefined}
+                                  >
                                     <summary className="cursor-pointer select-none text-[11px] text-zinc-400">思考</summary>
                                     <div className="mt-2 rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 whitespace-pre-wrap break-words text-[11px] text-zinc-500">
                                       <ReactMarkdown remarkPlugins={[remarkGfm]}>
@@ -571,7 +807,6 @@ export function ChatList({ messages, isLoading, streamingMessage, isSidePanelOpe
                     return (
                       <div key="stream-tools" className="space-y-2">
                         {tools.map((tool, idx) => {
-                          const running = tool.status === 'running';
                           const label =
                             tool.toolName && tool.serverName ? `${tool.serverName} / ${tool.toolName}` : tool.name;
                           const argsText = tool.args
@@ -583,89 +818,96 @@ export function ChatList({ messages, isLoading, streamingMessage, isSidePanelOpe
                                 }
                               })()
                             : '';
-                          const resultText = tool.error ? tool.error : tool.result ?? '';
-                          const argsPreview = argsText ? truncateText(argsText, 240) : '';
-                          const resultPreview = resultText ? truncateText(resultText, 320) : '';
+                          const resultTextRaw = tool.error ? tool.error : tool.result ?? '';
+                          const summary = getToolSummary(tool.name, tool.args, resultTextRaw, Boolean(tool.error));
+                          const resultText = prettifyJson(resultTextRaw);
+                          const webSearchResult =
+                            !tool.error && isWebSearchTool(tool.name) ? parseWebSearchResult(resultTextRaw) : null;
+                          const hasWebSearchResults = (webSearchResult?.results?.length ?? 0) > 0;
+                          const duration = formatDuration(tool.durationMs);
                           return (
                             <details
                               key={tool.callId ?? `${tool.name}-${idx}`}
-                              className="w-full rounded-xl border border-zinc-200/70 dark:border-zinc-800/70 bg-white/70 dark:bg-zinc-950/40 px-3 py-2"
+                              className="group/item"
                             >
-                              <summary
-                                className={cn(
-                                  'cursor-pointer select-none -mx-2 px-2 py-1 rounded-lg',
-                                  running ? 'relative overflow-hidden' : ''
-                                )}
-                              >
-                                {running && (
-                                  <span className="pointer-events-none absolute inset-0">
-                                    <span
-                                      className="absolute -inset-12 opacity-55 blur-2xl"
-                                      style={{
-                                        background:
-                                          'conic-gradient(from 180deg at 50% 50%, rgba(16,185,129,.35), rgba(34,211,238,.38), rgba(59,130,246,.18), rgba(16,185,129,.35))',
-                                        animation: 'vf_spin 10s linear infinite'
-                                      }}
-                                    />
-                                    <span className="absolute inset-0 vf-noise opacity-[0.10] mix-blend-overlay" />
-                                    <span
-                                      className="absolute inset-y-0 -left-1/2 w-1/2 opacity-40"
-                                      style={{
-                                        background:
-                                          'linear-gradient(90deg, transparent, rgba(255,255,255,.70), rgba(34,211,238,.25), transparent)',
-                                        animation: 'vf_sweep 2.2s ease-in-out infinite'
-                                      }}
-                                    />
+                              <summary className="flex items-center gap-3 px-2 py-1.5 rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800/50 cursor-pointer select-none">
+                                <div className="flex items-center gap-2 min-w-0 flex-1">
+                                  <span className="text-zinc-400">
+                                    {getToolIcon(tool.name)}
                                   </span>
-                                )}
-                                <div className={cn('flex items-center justify-between gap-3', running ? 'relative z-10' : '')}>
-                                  <div className="flex items-center gap-2 min-w-0">
-                                    <span className="inline-flex items-center rounded-full border border-indigo-200/70 dark:border-indigo-700/60 bg-indigo-50/80 dark:bg-indigo-900/20 px-2 py-0.5 text-[10px] font-medium text-indigo-700 dark:text-indigo-300">
-                                      Tool
+                                  <span className="text-xs text-zinc-700 dark:text-zinc-200 truncate font-medium">
+                                    {label}
+                                  </span>
+                                  {summary && (
+                                    <span className="inline-flex max-w-[200px] truncate rounded-full bg-zinc-100 dark:bg-zinc-800 px-2 py-0.5 text-[10px] text-zinc-500 dark:text-zinc-400">
+                                      {summary}
                                     </span>
-                                    <span className="font-medium text-zinc-800 dark:text-zinc-100 truncate">{label}</span>
-                                  </div>
-                                  <span className="text-[10px] text-zinc-400 shrink-0">
-                                    {tool.status}
-                                    {typeof tool.durationMs === 'number' ? ` · ${tool.durationMs}ms` : ''}
-                                  </span>
+                                  )}
+                                </div>
+                                <div className="flex items-center gap-2 shrink-0">
+                                  {duration && <span className="text-[10px] text-zinc-400">{duration}</span>}
+                                  <StatusBadge status={tool.status} />
                                 </div>
                               </summary>
                               {(argsText || resultText) && (
-                                <div className="mt-2 space-y-2">
+                                <div className="pl-9 pr-2 pb-2 text-xs space-y-2">
                                   {argsText && (
-                                    <div>
-                                      <div className="text-[10px] text-zinc-400 mb-1">Args</div>
-                                      <div className="whitespace-pre-wrap break-all">{argsPreview}</div>
-                                      {argsText.length > argsPreview.length && (
-                                        <details className="mt-1">
-                                          <summary className="cursor-pointer select-none text-[11px] text-zinc-400">
-                                            展开
-                                          </summary>
-                                          <div className="mt-2 rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 whitespace-pre-wrap break-all">
-                                            {argsText}
-                                          </div>
-                                        </details>
-                                      )}
+                                    <div className="bg-zinc-50 dark:bg-zinc-900/50 rounded-lg p-2 border border-zinc-100 dark:border-zinc-800">
+                                      <div className="text-[10px] text-zinc-400 mb-1 font-medium">Args</div>
+                                      <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-[10px] text-zinc-600 dark:text-zinc-300">
+                                        {argsText}
+                                      </pre>
                                     </div>
                                   )}
                                   {resultText && (
-                                    <div>
-                                      <div className={`text-[10px] mb-1 ${tool.error ? 'text-rose-400' : 'text-zinc-400'}`}>
+                                    <div className="bg-zinc-50 dark:bg-zinc-900/50 rounded-lg p-2 border border-zinc-100 dark:border-zinc-800">
+                                      <div className={cn("text-[10px] mb-1 font-medium", tool.error ? "text-rose-400" : "text-zinc-400")}>
                                         {tool.error ? 'Error' : 'Result'}
                                       </div>
-                                      <div className={`whitespace-pre-wrap break-all ${tool.error ? 'text-rose-500' : ''}`}>
-                                        {resultPreview}
-                                      </div>
-                                      {resultText.length > resultPreview.length && (
-                                        <details className="mt-1">
-                                          <summary className="cursor-pointer select-none text-[11px] text-zinc-400">
-                                            展开
-                                          </summary>
-                                          <div className="mt-2 rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 whitespace-pre-wrap break-all">
-                                            {resultText}
+                                      {hasWebSearchResults ? (
+                                        <div className="space-y-2">
+                                          {webSearchResult?.answer && (
+                                            <div className="rounded-md border border-zinc-200/70 dark:border-zinc-800/70 bg-white/70 dark:bg-zinc-950/50 px-2 py-1 text-[10px] text-zinc-600 dark:text-zinc-300">
+                                              {webSearchResult.answer}
+                                            </div>
+                                          )}
+                                          <div className="space-y-2">
+                                            {webSearchResult?.results.map((result, resultIndex) => (
+                                              <a
+                                                key={`${result.url || result.title}-${resultIndex}`}
+                                                href={result.url || '#'}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                className="block rounded-lg border border-zinc-200/70 dark:border-zinc-800/70 bg-white/80 dark:bg-zinc-950/60 px-2 py-1.5 transition-colors hover:border-zinc-300 dark:hover:border-zinc-700 hover:bg-white dark:hover:bg-zinc-900"
+                                              >
+                                                <div className="flex items-start justify-between gap-2">
+                                                  <div className="text-[11px] font-medium text-zinc-700 dark:text-zinc-200">
+                                                    {result.title || result.url || '未命名结果'}
+                                                  </div>
+                                                  {typeof result.score === 'number' && (
+                                                    <span className="text-[10px] text-zinc-400 shrink-0">
+                                                      {Math.round(result.score * 100)}%
+                                                    </span>
+                                                  )}
+                                                </div>
+                                                {result.url && (
+                                                  <div className="text-[10px] text-blue-600 dark:text-blue-400 truncate">
+                                                    {result.url}
+                                                  </div>
+                                                )}
+                                                {result.content && (
+                                                  <div className="text-[10px] text-zinc-500 dark:text-zinc-400 whitespace-pre-wrap">
+                                                    {truncateText(result.content, 220)}
+                                                  </div>
+                                                )}
+                                              </a>
+                                            ))}
                                           </div>
-                                        </details>
+                                        </div>
+                                      ) : (
+                                        <pre className={cn("overflow-x-auto whitespace-pre-wrap font-mono text-[10px]", tool.error ? "text-rose-500" : "text-zinc-600 dark:text-zinc-300")}>
+                                          {resultText}
+                                        </pre>
                                       )}
                                     </div>
                                   )}

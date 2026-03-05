@@ -21,6 +21,7 @@ export interface Message {
       name: string;
       serverName?: string;
       toolName?: string;
+      agentName?: string;
       status: 'running' | 'done' | 'error';
       durationMs?: number;
       args?: Record<string, unknown>;
@@ -59,6 +60,7 @@ export interface Message {
           name: string;
           serverName?: string;
           toolName?: string;
+          agentName?: string;
           status: 'running' | 'done' | 'error';
           durationMs?: number;
           args?: Record<string, unknown>;

@@ -400,6 +400,7 @@ type ToolExecutionContext = {
   threadId?: string
   send?: (event: string, data: unknown) => void
   openAiThinkingExtras?: Record<string, unknown>
+  currentAgentName?: string
   toolset?: {
     tools: OpenAiToolDefinition[]
     toolMap: Map<string, { serverName: string; toolName: string; server: McpServerConfig }>
@@ -557,7 +558,9 @@ const buildLocalToolset = (threadData: ThreadData, threadId: string) => {
     }
     if (rawPath.startsWith(sandboxPrefix)) {
       const relative = rawPath.slice(sandboxPrefix.length).replace(/^\/+/, '')
-      const [subdir, rest] = relative.split('/', 2)
+      const parts = relative.split('/').filter((p) => p.trim().length > 0)
+      const subdir = parts[0] ?? ''
+      const rest = parts.slice(1).join('/')
       const base =
         subdir === 'workspace'
           ? threadData.workspacePath
@@ -592,7 +595,9 @@ const buildLocalToolset = (threadData: ThreadData, threadId: string) => {
     const trimmed = rawPath.trim()
     if (trimmed.startsWith(sandboxPrefix)) {
       const relative = trimmed.slice(sandboxPrefix.length).replace(/^\/+/, '')
-      const [subdir, rest] = relative.split('/', 2)
+      const parts = relative.split('/').filter((p) => p.trim().length > 0)
+      const subdir = parts[0] ?? ''
+      const rest = parts.slice(1).join('/')
       if (subdir !== 'workspace' && subdir !== 'uploads' && subdir !== 'outputs') {
         throw new Error('Invalid sandbox path')
       }
@@ -663,8 +668,11 @@ const buildLocalToolset = (threadData: ThreadData, threadId: string) => {
       const base = normalized.startsWith('/tmp/user-data/') ? normalized.slice('/tmp/user-data/'.length) : normalized
       const stripped = base.replace(/^\/+/, '')
       if (!stripped) return ''
-      const [first, rest] = stripped.split('/', 2)
-      const withoutBucket = first === 'workspace' || first === 'uploads' || first === 'outputs' ? rest ?? '' : stripped
+      const parts = stripped.split('/').filter((p) => p.trim().length > 0)
+      const first = parts[0] ?? ''
+      const rest = parts.slice(1).join('/')
+      const withoutBucket =
+        first === 'workspace' || first === 'uploads' || first === 'outputs' ? rest : parts.join('/')
       if (!withoutBucket) return ''
       if (!threadSandbox && sandboxPerThread && withoutBucket.startsWith(`${threadId}/`)) {
         return withoutBucket.slice(threadId.length + 1)
@@ -3530,6 +3538,7 @@ chatRoute.post('/stream', async (c) => {
           }
         | {
             type: 'tool'
+            agentName?: string
             callId?: string
             name: string
             serverName?: string
@@ -3541,6 +3550,7 @@ chatRoute.post('/stream', async (c) => {
             error?: string
           }
       > = []
+      const agentStack: string[] = []
       const updateAgentTimeline = (entry: {
         name: string
         status?: 'running' | 'done' | 'error'
@@ -3587,6 +3597,7 @@ chatRoute.post('/stream', async (c) => {
             const name = (data as any)?.name
             if (typeof name === 'string' && name.length > 0) {
               updateAgentTimeline({ name, status: 'running' })
+              agentStack.push(name)
             }
           }
           if (event === 'agent_end') {
@@ -3598,6 +3609,13 @@ chatRoute.post('/stream', async (c) => {
                 status: 'done',
                 durationMs: typeof durationMs === 'number' ? durationMs : undefined
               })
+              const last = agentStack.length > 0 ? agentStack[agentStack.length - 1] : null
+              if (last === name) {
+                agentStack.pop()
+              } else {
+                const index = agentStack.lastIndexOf(name)
+                if (index >= 0) agentStack.splice(index, 1)
+              }
             }
           }
           if (event === 'agent') {
@@ -3720,6 +3738,12 @@ chatRoute.post('/stream', async (c) => {
             const toolName = (data as any)?.toolName
             const args = (data as any)?.args
             if (typeof name === 'string' && name.length > 0) {
+              const stackAgent = agentStack.length > 0 ? agentStack[agentStack.length - 1] : undefined
+              const payloadAgent = typeof (data as any)?.agentName === 'string' ? (data as any).agentName : undefined
+              const agentName = payloadAgent ?? stackAgent
+              if (agentName && typeof (data as any)?.agentName !== 'string') {
+                ;(data as any).agentName = agentName
+              }
               const resolvedCallId = typeof callId === 'string' && callId.length > 0 ? callId : undefined
               const last = findLastTrace(
                 (item) =>
@@ -3730,6 +3754,7 @@ chatRoute.post('/stream', async (c) => {
               if (last && last.type === 'tool') {
                 last.callId = resolvedCallId ?? last.callId
                 last.name = name
+                if (agentName) last.agentName = agentName
                 if (typeof serverName === 'string' && serverName) last.serverName = serverName
                 if (typeof toolName === 'string' && toolName) last.toolName = toolName
                 if (typeof args === 'object' && args) {
@@ -3738,6 +3763,7 @@ chatRoute.post('/stream', async (c) => {
               } else {
                 trace.push({
                   type: 'tool',
+                  agentName,
                   callId: resolvedCallId,
                   name,
                   serverName: typeof serverName === 'string' ? serverName : undefined,
@@ -3802,6 +3828,12 @@ chatRoute.post('/stream', async (c) => {
             const result = (data as any)?.result
             const error = (data as any)?.error
             if (typeof name === 'string' && name.length > 0) {
+              const stackAgent = agentStack.length > 0 ? agentStack[agentStack.length - 1] : undefined
+              const payloadAgent = typeof (data as any)?.agentName === 'string' ? (data as any).agentName : undefined
+              const agentName = payloadAgent ?? stackAgent
+              if (agentName && typeof (data as any)?.agentName !== 'string') {
+                ;(data as any).agentName = agentName
+              }
               const matchId = typeof callId === 'string' && callId.length > 0 ? callId : undefined
               const last = findLastTrace(
                 (item) =>
@@ -3812,12 +3844,14 @@ chatRoute.post('/stream', async (c) => {
               const status: 'done' | 'error' = ok === false ? 'error' : 'done'
               if (last && last.type === 'tool') {
                 last.status = status
+                if (agentName) last.agentName = agentName
                 last.durationMs = typeof durationMs === 'number' ? durationMs : undefined
                 if (typeof result === 'string') last.result = result
                 if (typeof error === 'string') last.error = error
               } else {
                 trace.push({
                   type: 'tool',
+                  agentName,
                   callId: matchId,
                   name,
                   status,
@@ -3950,6 +3984,7 @@ chatRoute.post('/stream', async (c) => {
             name: string
             serverName?: string
             toolName?: string
+            agentName?: string
             status: 'running' | 'done' | 'error'
             durationMs?: number
             args?: Record<string, unknown>
@@ -3971,6 +4006,7 @@ chatRoute.post('/stream', async (c) => {
                 name,
                 serverName: typeof data.serverName === 'string' ? data.serverName : undefined,
                 toolName: typeof data.toolName === 'string' ? data.toolName : undefined,
+                agentName: typeof data.agentName === 'string' ? data.agentName : undefined,
                 status: 'running' as const,
                 args: (data.args as Record<string, unknown>) ?? undefined
               }
@@ -3986,6 +4022,7 @@ chatRoute.post('/stream', async (c) => {
               callId,
               name,
               status,
+              agentName: typeof data.agentName === 'string' ? data.agentName : undefined,
               durationMs: typeof data.durationMs === 'number' ? data.durationMs : undefined,
               result: typeof data.result === 'string' ? data.result : undefined,
               error: typeof data.error === 'string' ? data.error : undefined
@@ -3998,13 +4035,16 @@ chatRoute.post('/stream', async (c) => {
           }
 
           const onToolEvent = (event: 'tool_start' | 'tool_end', data: Record<string, unknown>) => {
-            updateToolTimeline(event, data)
-            send(event, data)
+            const activeAgent = agentStack.length > 0 ? agentStack[agentStack.length - 1] : undefined
+            const enriched =
+              activeAgent && typeof (data as any)?.agentName !== 'string' ? ({ ...data, agentName: activeAgent } as Record<string, unknown>) : data
+            updateToolTimeline(event, enriched)
+            send(event, enriched)
             if (event !== 'tool_end') return
-            const name = typeof data.name === 'string' ? data.name : ''
+            const name = typeof enriched.name === 'string' ? enriched.name : ''
             if (name !== 'write_file') return
-            if (data.ok === false) return
-            const result = typeof data.result === 'string' ? data.result : ''
+            if (enriched.ok === false) return
+            const result = typeof enriched.result === 'string' ? enriched.result : ''
             if (!result) return
             const artifacts = buildFileArtifacts([{ name, result }])
             if (!artifacts.length) return

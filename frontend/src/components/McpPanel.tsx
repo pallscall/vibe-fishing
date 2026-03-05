@@ -20,6 +20,7 @@ type McpConfigResponse = {
 }
 
 const fetcher = (url: string) => fetch(url).then((res) => res.json())
+const API_BASE_URL = (process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:8000').replace(/\/+$/, '')
 
 type McpServerDraft = {
   name: string
@@ -64,7 +65,7 @@ const extractServerConfig = (name: string, parsed: unknown) => {
 
 export function McpPanel() {
   const { data, error, mutate, isLoading } = useSWR<McpConfigResponse>(
-    'http://localhost:8000/mcp/config',
+    `${API_BASE_URL}/mcp/config`,
     fetcher
   )
   const [pending, setPending] = useState<Record<string, boolean>>({})
@@ -92,7 +93,7 @@ export function McpPanel() {
     }
     setPending((prev) => ({ ...prev, [name]: true }))
     try {
-      await fetch('http://localhost:8000/mcp/config', {
+      await fetch(`${API_BASE_URL}/mcp/config`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mcpServers: next })
@@ -131,7 +132,7 @@ export function McpPanel() {
     }
     setPending((prev) => ({ ...prev, [draft.name]: true }))
     try {
-      await fetch('http://localhost:8000/mcp/config', {
+      await fetch(`${API_BASE_URL}/mcp/config`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mcpServers: next })
@@ -193,7 +194,7 @@ export function McpPanel() {
     delete next[name]
     setPending((prev) => ({ ...prev, [name]: true }))
     try {
-      await fetch('http://localhost:8000/mcp/config', {
+      await fetch(`${API_BASE_URL}/mcp/config`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mcpServers: next })

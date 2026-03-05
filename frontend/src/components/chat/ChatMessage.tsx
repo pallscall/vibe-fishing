@@ -3,7 +3,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { cn } from '@/lib/utils';
 import { Message } from '@/lib/types';
-import { Bot, Check, ChevronDown, Copy, Lightbulb, User } from 'lucide-react';
+import { Bot, Check, ChevronDown, Copy, Lightbulb, Terminal, User, FileText, Image as ImageIcon, ListTodo, Pencil, Search, LayoutTemplate, Code, Wrench, Shield, AlertTriangle, Eye, EyeOff, Globe } from 'lucide-react';
 import { motion } from 'framer-motion';
 
 interface ChatMessageProps {
@@ -14,6 +14,118 @@ interface ChatMessageProps {
 const truncateText = (value: string, maxChars = 320) => {
   if (value.length <= maxChars) return value;
   return `${value.slice(0, maxChars)}…`;
+};
+
+const getToolIcon = (name: string) => {
+  const n = name.toLowerCase();
+  if (n.includes('read') || n.includes('file')) return <FileText className="h-3.5 w-3.5" />;
+  if (n.includes('image') || n.includes('photo')) return <ImageIcon className="h-3.5 w-3.5" />;
+  if (n.includes('todo') || n.includes('task')) return <ListTodo className="h-3.5 w-3.5" />;
+  if (n.includes('search') || n.includes('find') || n.includes('query')) return <Search className="h-3.5 w-3.5" />;
+  if (n.includes('skill')) return <LayoutTemplate className="h-3.5 w-3.5" />;
+  if (n.includes('write') || n.includes('create') || n.includes('edit')) return <Pencil className="h-3.5 w-3.5" />;
+  if (n.includes('code') || n.includes('snippet')) return <Code className="h-3.5 w-3.5" />;
+  if (n.includes('web') || n.includes('fetch')) return <Globe className="h-3.5 w-3.5" />;
+  if (n.includes('run') || n.includes('exec') || n.includes('command')) return <Terminal className="h-3.5 w-3.5" />;
+  return <Wrench className="h-3.5 w-3.5" />;
+};
+
+const getToolSummary = (args: any) => {
+  try {
+    const a = typeof args === 'string' ? JSON.parse(args) : args;
+    if (!a) return null;
+    if (a.file_path) return a.file_path;
+    if (a.query) return a.query;
+    if (a.command) return a.command;
+    if (a.url) return a.url;
+    if (a.name) return a.name;
+    if (a.pattern) return a.pattern;
+    const values = Object.values(a).filter((v): v is string => typeof v === 'string' && v.length < 50);
+    if (values.length > 0) return values[0];
+    return null;
+  } catch {
+    return null;
+  }
+};
+
+const toSingleLine = (value: string) => {
+  return value.replace(/\s+/g, ' ').trim();
+};
+
+const isWebSearchTool = (name: string) => {
+  const n = name.toLowerCase();
+  return n.includes('web_search') || n.includes('websearch');
+};
+
+const parseWebSearchResult = (value: string) => {
+  const trimmed = value.trim();
+  if (!trimmed || (!trimmed.startsWith('{') && !trimmed.startsWith('['))) return null;
+  try {
+    const data = JSON.parse(trimmed) as {
+      query?: unknown;
+      answer?: unknown;
+      results?: Array<{
+        title?: unknown;
+        url?: unknown;
+        content?: unknown;
+        score?: unknown;
+      }>;
+    };
+    const results = Array.isArray(data?.results)
+      ? data.results
+          .map((item) => ({
+            title: typeof item?.title === 'string' ? item.title : '',
+            url: typeof item?.url === 'string' ? item.url : '',
+            content: typeof item?.content === 'string' ? item.content : '',
+            score: typeof item?.score === 'number' ? item.score : undefined
+          }))
+          .filter((item) => item.title || item.url || item.content)
+      : [];
+    if (results.length === 0 && typeof data?.answer !== 'string') return null;
+    return {
+      query: typeof data?.query === 'string' ? data.query : '',
+      answer: typeof data?.answer === 'string' ? data.answer : '',
+      results
+    };
+  } catch {
+    return null;
+  }
+};
+
+const formatDuration = (durationMs?: number) => {
+  if (typeof durationMs !== 'number' || !Number.isFinite(durationMs) || durationMs < 0) return '';
+  if (durationMs < 1000) return `${Math.round(durationMs)}ms`;
+  const seconds = durationMs / 1000;
+  return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
+};
+
+const StatusBadge = ({ status }: { status: 'running' | 'done' | 'error' }) => {
+  const config = (() => {
+    if (status === 'running') {
+      return {
+        label: '运行中',
+        className:
+          'border-amber-200/70 dark:border-amber-600/40 bg-amber-50/80 dark:bg-amber-900/20 text-amber-700 dark:text-amber-300'
+      };
+    }
+    if (status === 'error') {
+      return {
+        label: '失败',
+        className:
+          'border-rose-200/70 dark:border-rose-600/40 bg-rose-50/80 dark:bg-rose-900/20 text-rose-700 dark:text-rose-300'
+      };
+    }
+    return {
+      label: '完成',
+      className:
+        'border-emerald-200/70 dark:border-emerald-600/40 bg-emerald-50/80 dark:bg-emerald-900/20 text-emerald-700 dark:text-emerald-300'
+    };
+  })();
+  return (
+    <span className={cn('inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium', config.className)}>
+      {config.label}
+    </span>
+  );
 };
 
 const CodeBlock = ({ code, language }: { code: string; language?: string }) => {
@@ -109,6 +221,7 @@ export function ChatMessage({ message, mode }: ChatMessageProps) {
   const toolTimeline = message.meta?.toolTimeline ?? [];
   const agentTimeline = message.meta?.agentTimeline ?? [];
   const trace = message.meta?.trace ?? [];
+  const traceItems = toolTimeline.length > 0 ? trace.filter((item) => item.type !== 'tool') : trace;
   const skills = message.meta?.skills ?? [];
   const skillReads = message.meta?.skillReads ?? [];
   const tokenUsage = message.meta?.tokenUsage;
@@ -235,125 +348,173 @@ export function ChatMessage({ message, mode }: ChatMessageProps) {
             )}
           </div>
         )}
-        {trace.length > 0 && (
-          <div className="mt-3 space-y-2">
-            {trace.map((item, idx) => {
-              if (item.type === 'agent') {
-                const phaseLabel = item.phase === 'thinking' ? 'thinking' : 'output';
-                return (
-                  <details
-                    key={`${item.type}-${item.agentName}-${item.phase}-${idx}`}
-                    className="rounded-xl border border-zinc-200/70 dark:border-zinc-800/70 bg-white/70 dark:bg-zinc-950/40 px-3 py-2"
-                  >
-                    <summary className="cursor-pointer select-none flex items-center justify-between gap-3">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <span className="inline-flex items-center rounded-full border border-emerald-200/70 dark:border-emerald-700/60 bg-emerald-50/80 dark:bg-emerald-900/20 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-300">
-                          Agent
-                        </span>
-                        <span className="text-xs font-semibold text-zinc-800 dark:text-zinc-100 truncate">
-                          {item.agentName} · {phaseLabel}
-                        </span>
-                      </div>
-                      <span className="text-[10px] text-zinc-400 shrink-0">
-                        {item.status}
-                        {typeof item.durationMs === 'number' ? ` · ${item.durationMs}ms` : ''}
-                      </span>
-                    </summary>
-                    {item.content && (
-                      <MarkdownContent
-                        className={cn('mt-2', item.phase === 'thinking' ? 'text-[11px] text-zinc-500' : 'text-[12px]')}
-                      >
-                        {item.content}
-                      </MarkdownContent>
-                    )}
-                  </details>
-                );
-              }
-              const label = item.toolName && item.serverName ? `${item.serverName} / ${item.toolName}` : item.name;
-              const argsText = item.args ? (() => { try { return JSON.stringify(item.args, null, 2); } catch { return ''; } })() : '';
-              const resultTextRaw = item.error ? item.error : item.result ?? '';
-              const resultText = prettifyJson(resultTextRaw);
-              const argsPreview = argsText ? truncateText(argsText, 240) : '';
-              const resultPreview = resultText ? truncateText(resultText, 320) : '';
-              return (
-                <details
-                  key={`${item.type}-${item.callId ?? item.name}-${idx}`}
-                  className="rounded-xl border border-zinc-200/70 dark:border-zinc-800/70 bg-white/70 dark:bg-zinc-950/40 px-3 py-2"
-                >
-                  <summary className="cursor-pointer select-none flex items-center justify-between gap-3">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <span className="inline-flex items-center rounded-full border border-indigo-200/70 dark:border-indigo-700/60 bg-indigo-50/80 dark:bg-indigo-900/20 px-2 py-0.5 text-[10px] font-medium text-indigo-700 dark:text-indigo-300">
-                        Tool
-                      </span>
-                      <span className="text-xs font-semibold text-zinc-800 dark:text-zinc-100 truncate">{label}</span>
-                    </div>
-                    <span className="text-[10px] text-zinc-400 shrink-0">
-                      {item.status}
-                      {typeof item.durationMs === 'number' ? ` · ${item.durationMs}ms` : ''}
-                    </span>
-                  </summary>
-                  {(argsText || resultText) && (
-                    <div className="mt-2 text-xs text-zinc-500 space-y-2">
-                      {argsText && (
-                        <div>
-                          <div className="text-[11px] text-zinc-400 mb-1">Args</div>
-                          <pre className="rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 overflow-x-auto whitespace-pre text-[11px] text-zinc-600 dark:text-zinc-300">
-                            <code className="font-mono">{argsPreview}</code>
-                          </pre>
-                          {argsText.length > argsPreview.length && (
-                            <details className="group mt-1">
-                              <summary className="cursor-pointer select-none text-[11px] text-zinc-400 inline-flex items-center gap-1">
-                                <span className="group-open:hidden">展开</span>
-                                <span className="hidden group-open:inline">收起</span>
-                                <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
-                              </summary>
-                              <pre className="mt-2 rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 overflow-x-auto whitespace-pre text-[11px] text-zinc-600 dark:text-zinc-300">
-                                <code className="font-mono">{argsText}</code>
-                              </pre>
-                            </details>
+        {traceItems.length > 0 && (
+          <div className="mt-4 mb-4">
+            <details className="group">
+              <summary className="list-none flex items-center gap-2 mb-3 cursor-pointer select-none outline-none">
+                <div className="flex items-center gap-2 text-zinc-400 px-1 hover:text-zinc-600 dark:hover:text-zinc-300 transition-colors">
+                  <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
+                  <span className="text-xs font-medium">Execution Process</span>
+                  <span className="text-[10px] bg-zinc-100 dark:bg-zinc-800 px-1.5 py-0.5 rounded-full text-zinc-500 dark:text-zinc-400">{traceItems.length}</span>
+                </div>
+              </summary>
+              
+              <div className="space-y-2 pl-1">
+                {traceItems.map((item, idx) => {
+                  const isAgent = item.type === 'agent';
+                  
+                  // Common props
+                  const duration = formatDuration(item.durationMs);
+                  let label = '';
+                  let icon = null;
+                  let summaryTag = null;
+                  let content: React.ReactNode = null;
+
+                  if (isAgent) {
+                    const phaseLabel = item.phase === 'thinking' ? '思考' : '输出';
+                    label = `${item.agentName} · ${phaseLabel}`;
+                    icon = <Bot className="h-4 w-4" />;
+                    if (item.content) {
+                      content = (
+                        <div className="pl-9 pr-4 pb-3">
+                          <MarkdownContent
+                            className={cn('text-[11px] text-zinc-500', item.phase === 'thinking' ? 'italic' : '')}
+                          >
+                            {item.content}
+                          </MarkdownContent>
+                        </div>
+                      );
+                    }
+                  } else {
+                    label = item.toolName && item.serverName ? `${item.serverName} / ${item.toolName}` : item.name;
+                    icon = getToolIcon(item.name);
+                    const summary = getToolSummary(item.args);
+                    if (summary) {
+                      summaryTag = (
+                         <span className="hidden sm:inline-flex max-w-[150px] truncate rounded-full bg-zinc-100 dark:bg-zinc-800 px-2 py-0.5 text-[10px] text-zinc-500 dark:text-zinc-400 border border-zinc-200/50 dark:border-zinc-700/50">
+                           {summary}
+                         </span>
+                      );
+                    }
+
+                    const argsText = item.args ? (() => { try { return JSON.stringify(item.args, null, 2); } catch { return ''; } })() : '';
+                    const resultTextRaw = item.error ? item.error : item.result ?? '';
+                    const resultText = prettifyJson(resultTextRaw);
+                    const webSearchResult =
+                      !item.error && isWebSearchTool(item.name) ? parseWebSearchResult(resultTextRaw) : null;
+                    const hasWebSearchResults = (webSearchResult?.results?.length ?? 0) > 0;
+
+                    if (argsText || resultText) {
+                      content = (
+                        <div className="pl-9 pr-4 pb-3 text-xs space-y-2">
+                           {argsText && (
+                             <div className="bg-zinc-50 dark:bg-zinc-900/50 rounded-lg p-2.5 border border-zinc-100 dark:border-zinc-800">
+                               <div className="text-[10px] text-zinc-400 mb-1 font-medium select-none">Args</div>
+                               <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-[10px] text-zinc-600 dark:text-zinc-300 leading-relaxed">
+                                 {argsText}
+                               </pre>
+                             </div>
+                           )}
+                          {resultText && (
+                            <div className="bg-zinc-50 dark:bg-zinc-900/50 rounded-lg p-2.5 border border-zinc-100 dark:border-zinc-800">
+                              <div className={cn("text-[10px] mb-1 font-medium select-none", item.error ? "text-rose-400" : "text-zinc-400")}>
+                                {item.error ? 'Error' : 'Result'}
+                              </div>
+                              {hasWebSearchResults ? (
+                                <div className="space-y-2">
+                                  {webSearchResult?.answer && (
+                                    <div className="rounded-md border border-zinc-200/70 dark:border-zinc-800/70 bg-white/70 dark:bg-zinc-950/50 px-2 py-1 text-[10px] text-zinc-600 dark:text-zinc-300">
+                                      {webSearchResult.answer}
+                                    </div>
+                                  )}
+                                  <div className="space-y-2">
+                                    {webSearchResult?.results.map((result, resultIndex) => (
+                                      <a
+                                        key={`${result.url || result.title}-${resultIndex}`}
+                                        href={result.url || '#'}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="block rounded-lg border border-zinc-200/70 dark:border-zinc-800/70 bg-white/80 dark:bg-zinc-950/60 px-2 py-1.5 transition-colors hover:border-zinc-300 dark:hover:border-zinc-700 hover:bg-white dark:hover:bg-zinc-900"
+                                      >
+                                        <div className="flex items-start justify-between gap-2">
+                                          <div className="text-[11px] font-medium text-zinc-700 dark:text-zinc-200">
+                                            {result.title || result.url || '未命名结果'}
+                                          </div>
+                                          {typeof result.score === 'number' && (
+                                            <span className="text-[10px] text-zinc-400 shrink-0">
+                                              {Math.round(result.score * 100)}%
+                                            </span>
+                                          )}
+                                        </div>
+                                        {result.url && (
+                                          <div className="text-[10px] text-blue-600 dark:text-blue-400 truncate">
+                                            {result.url}
+                                          </div>
+                                        )}
+                                        {result.content && (
+                                          <div className="text-[10px] text-zinc-500 dark:text-zinc-400 whitespace-pre-wrap">
+                                            {truncateText(result.content, 220)}
+                                          </div>
+                                        )}
+                                      </a>
+                                    ))}
+                                  </div>
+                                </div>
+                              ) : (
+                                <pre className={cn("overflow-x-auto whitespace-pre-wrap font-mono text-[10px] leading-relaxed", item.error ? "text-rose-500" : "text-zinc-600 dark:text-zinc-300")}>
+                                  {resultText}
+                                </pre>
+                              )}
+                            </div>
                           )}
                         </div>
-                      )}
-                      {resultText && (
-                        <div>
-                          <div className={`text-[11px] mb-1 ${item.error ? 'text-rose-400' : 'text-zinc-400'}`}>
-                            {item.error ? 'Error' : 'Result'}
-                          </div>
-                          <pre className={cn(
-                            'rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 overflow-x-auto whitespace-pre text-[11px]',
-                            item.error ? 'text-rose-500' : 'text-zinc-600 dark:text-zinc-300'
-                          )}>
-                            <code className="font-mono">{resultPreview}</code>
-                          </pre>
-                          {resultText.length > resultPreview.length && (
-                            <details className="group mt-1">
-                              <summary className="cursor-pointer select-none text-[11px] text-zinc-400 inline-flex items-center gap-1">
-                                <span className="group-open:hidden">展开</span>
-                                <span className="hidden group-open:inline">收起</span>
-                                <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
-                              </summary>
-                              <pre className={cn(
-                                'mt-2 rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 overflow-x-auto whitespace-pre text-[11px]',
-                                item.error ? 'text-rose-500' : 'text-zinc-600 dark:text-zinc-300'
-                              )}>
-                                <code className="font-mono">{resultText}</code>
-                              </pre>
-                            </details>
+                      );
+                    }
+                  }
+
+                  return (
+                    <details
+                      key={isAgent ? `${item.type}-${item.agentName}-${item.phase}-${idx}` : `${item.type}-${item.callId ?? item.name}-${idx}`}
+                      className="group/item rounded-xl border transition-all duration-300 border-zinc-200/60 dark:border-zinc-800/60 bg-white dark:bg-zinc-950/40 hover:border-zinc-300 dark:hover:border-zinc-700 shadow-sm"
+                    >
+                      <summary className="flex items-center gap-3 px-4 py-3 cursor-pointer select-none">
+                        <div className="flex items-center justify-center w-6 h-6 rounded-lg shrink-0 transition-colors bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+                          {icon}
+                        </div>
+                        <div className="flex items-center gap-2 min-w-0 flex-1">
+                          <span className="text-xs font-medium truncate text-zinc-700 dark:text-zinc-200">
+                            {label}
+                          </span>
+                          {summaryTag}
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          {duration && <span className="text-[10px] text-zinc-400 font-mono">{duration}</span>}
+                          <StatusBadge status={item.status} />
+                          {content && (
+                            <ChevronDown className="h-3.5 w-3.5 text-zinc-300 transition-transform group-open/item:rotate-180" />
                           )}
                         </div>
-                      )}
-                    </div>
-                  )}
-                </details>
-              );
-            })}
+                      </summary>
+                      {content}
+                    </details>
+                  );
+                })}
+              </div>
+            </details>
           </div>
         )}
 
-        {trace.length === 0 && toolTimeline.length > 0 && (
-          <div className="mt-3 space-y-2">
+        {toolTimeline.length > 0 && (
+          <details className="mt-3 group rounded-xl border border-zinc-200/70 dark:border-zinc-800/70 bg-white/70 dark:bg-zinc-950/40 overflow-hidden">
+            <summary className="flex items-center gap-2 px-3 py-2 cursor-pointer select-none text-xs font-medium text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200 transition-colors bg-zinc-50/50 dark:bg-zinc-900/50">
+              <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
+              <span>隐藏步骤</span>
+              <span className="text-[10px] text-zinc-400 font-normal ml-auto">{toolTimeline.length} steps</span>
+            </summary>
+            <div className="p-1 space-y-0.5">
             {toolTimeline.map((tool, idx) => {
               const label = tool.toolName && tool.serverName ? `${tool.serverName} / ${tool.toolName}` : tool.name;
+              const summary = getToolSummary(tool.args);
               const argsText = tool.args
                 ? (() => {
                     try {
@@ -365,72 +526,93 @@ export function ChatMessage({ message, mode }: ChatMessageProps) {
                 : '';
               const resultTextRaw = tool.error ? tool.error : tool.result ?? '';
               const resultText = prettifyJson(resultTextRaw);
-              const argsPreview = argsText ? truncateText(argsText, 240) : '';
-              const resultPreview = resultText ? truncateText(resultText, 320) : '';
+              const webSearchResult =
+                !tool.error && isWebSearchTool(tool.name) ? parseWebSearchResult(resultTextRaw) : null;
+              const hasWebSearchResults = (webSearchResult?.results?.length ?? 0) > 0;
+              const duration = formatDuration(tool.durationMs);
               return (
                 <details
                   key={tool.callId ?? `${tool.name}-${idx}`}
-                  className="rounded-xl border border-zinc-200/70 dark:border-zinc-800/70 bg-white/70 dark:bg-zinc-950/40 px-3 py-2"
+                  className="group/item"
                 >
-                  <summary className="cursor-pointer select-none flex items-center justify-between gap-3">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <span className="inline-flex items-center rounded-full border border-indigo-200/70 dark:border-indigo-700/60 bg-indigo-50/80 dark:bg-indigo-900/20 px-2 py-0.5 text-[10px] font-medium text-indigo-700 dark:text-indigo-300">
-                        Tool
+                  <summary className="flex items-center gap-3 px-2 py-1.5 rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800/50 cursor-pointer select-none">
+                    <div className="flex items-center gap-2 min-w-0 flex-1">
+                      <span className="text-zinc-400">
+                        {getToolIcon(tool.name)}
                       </span>
-                      <span className="text-xs font-semibold text-zinc-800 dark:text-zinc-100 truncate">{label}</span>
+                      <span className="text-xs text-zinc-700 dark:text-zinc-200 truncate font-medium">
+                        {label}
+                      </span>
+                      {summary && (
+                        <span className="inline-flex max-w-[200px] truncate rounded-full bg-zinc-100 dark:bg-zinc-800 px-2 py-0.5 text-[10px] text-zinc-500 dark:text-zinc-400">
+                          {summary}
+                        </span>
+                      )}
                     </div>
-                    <span className="text-[10px] text-zinc-400 shrink-0">
-                      {tool.status}
-                      {typeof tool.durationMs === 'number' ? ` · ${tool.durationMs}ms` : ''}
-                    </span>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {duration && <span className="text-[10px] text-zinc-400">{duration}</span>}
+                      <StatusBadge status={tool.status} />
+                    </div>
                   </summary>
                   {(argsText || resultText) && (
-                    <div className="mt-2 text-xs text-zinc-500 space-y-2">
+                    <div className="pl-9 pr-2 pb-2 text-xs space-y-2">
                       {argsText && (
-                        <div>
-                          <div className="text-[11px] text-zinc-400 mb-1">Args</div>
-                          <pre className="rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 overflow-x-auto whitespace-pre text-[11px] text-zinc-600 dark:text-zinc-300">
-                            <code className="font-mono">{argsPreview}</code>
+                        <div className="bg-zinc-50 dark:bg-zinc-900/50 rounded-lg p-2 border border-zinc-100 dark:border-zinc-800">
+                          <div className="text-[10px] text-zinc-400 mb-1 font-medium">Args</div>
+                          <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-[10px] text-zinc-600 dark:text-zinc-300">
+                            {argsText}
                           </pre>
-                          {argsText.length > argsPreview.length && (
-                            <details className="group mt-1">
-                              <summary className="cursor-pointer select-none text-[11px] text-zinc-400 inline-flex items-center gap-1">
-                                <span className="group-open:hidden">展开</span>
-                                <span className="hidden group-open:inline">收起</span>
-                                <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
-                              </summary>
-                              <pre className="mt-2 rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 overflow-x-auto whitespace-pre text-[11px] text-zinc-600 dark:text-zinc-300">
-                                <code className="font-mono">{argsText}</code>
-                              </pre>
-                            </details>
-                          )}
                         </div>
                       )}
                       {resultText && (
-                        <div>
-                          <div className={`text-[11px] mb-1 ${tool.error ? 'text-rose-400' : 'text-zinc-400'}`}>
+                        <div className="bg-zinc-50 dark:bg-zinc-900/50 rounded-lg p-2 border border-zinc-100 dark:border-zinc-800">
+                          <div className={cn("text-[10px] mb-1 font-medium", tool.error ? "text-rose-400" : "text-zinc-400")}>
                             {tool.error ? 'Error' : 'Result'}
                           </div>
-                          <pre className={cn(
-                            'rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 overflow-x-auto whitespace-pre text-[11px]',
-                            tool.error ? 'text-rose-500' : 'text-zinc-600 dark:text-zinc-300'
-                          )}>
-                            <code className="font-mono">{resultPreview}</code>
-                          </pre>
-                          {resultText.length > resultPreview.length && (
-                            <details className="group mt-1">
-                              <summary className="cursor-pointer select-none text-[11px] text-zinc-400 inline-flex items-center gap-1">
-                                <span className="group-open:hidden">展开</span>
-                                <span className="hidden group-open:inline">收起</span>
-                                <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
-                              </summary>
-                              <pre className={cn(
-                                'mt-2 rounded-lg border border-zinc-200/60 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/70 p-2 overflow-x-auto whitespace-pre text-[11px]',
-                                tool.error ? 'text-rose-500' : 'text-zinc-600 dark:text-zinc-300'
-                              )}>
-                                <code className="font-mono">{resultText}</code>
-                              </pre>
-                            </details>
+                          {hasWebSearchResults ? (
+                            <div className="space-y-2">
+                              {webSearchResult?.answer && (
+                                <div className="rounded-md border border-zinc-200/70 dark:border-zinc-800/70 bg-white/70 dark:bg-zinc-950/50 px-2 py-1 text-[10px] text-zinc-600 dark:text-zinc-300">
+                                  {webSearchResult.answer}
+                                </div>
+                              )}
+                              <div className="space-y-2">
+                                {webSearchResult?.results.map((result, resultIndex) => (
+                                  <a
+                                    key={`${result.url || result.title}-${resultIndex}`}
+                                    href={result.url || '#'}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="block rounded-lg border border-zinc-200/70 dark:border-zinc-800/70 bg-white/80 dark:bg-zinc-950/60 px-2 py-1.5 transition-colors hover:border-zinc-300 dark:hover:border-zinc-700 hover:bg-white dark:hover:bg-zinc-900"
+                                  >
+                                    <div className="flex items-start justify-between gap-2">
+                                      <div className="text-[11px] font-medium text-zinc-700 dark:text-zinc-200">
+                                        {result.title || result.url || '未命名结果'}
+                                      </div>
+                                      {typeof result.score === 'number' && (
+                                        <span className="text-[10px] text-zinc-400 shrink-0">
+                                          {Math.round(result.score * 100)}%
+                                        </span>
+                                      )}
+                                    </div>
+                                    {result.url && (
+                                      <div className="text-[10px] text-blue-600 dark:text-blue-400 truncate">
+                                        {result.url}
+                                      </div>
+                                    )}
+                                    {result.content && (
+                                      <div className="text-[10px] text-zinc-500 dark:text-zinc-400 whitespace-pre-wrap">
+                                        {truncateText(result.content, 220)}
+                                      </div>
+                                    )}
+                                  </a>
+                                ))}
+                              </div>
+                            </div>
+                          ) : (
+                            <pre className={cn("overflow-x-auto whitespace-pre-wrap font-mono text-[10px]", tool.error ? "text-rose-500" : "text-zinc-600 dark:text-zinc-300")}>
+                              {resultText}
+                            </pre>
                           )}
                         </div>
                       )}
@@ -439,7 +621,8 @@ export function ChatMessage({ message, mode }: ChatMessageProps) {
                 </details>
               );
             })}
-          </div>
+            </div>
+          </details>
         )}
 
         {hasSections &&
@@ -450,7 +633,7 @@ export function ChatMessage({ message, mode }: ChatMessageProps) {
             if (section === 'risk' && !risk) return null;
             if (section === 'critic' && !critic) return null;
             if (section === 'tools') return null;
-            if (section === 'agents' && (trace.length > 0 || agentTimeline.length === 0)) return null;
+            if (section === 'agents' && (traceItems.length > 0 || agentTimeline.length === 0)) return null;
             const title =
               section === 'plan'
                   ? 'Plan'
@@ -509,7 +692,11 @@ export function ChatMessage({ message, mode }: ChatMessageProps) {
                             </div>
                           </div>
                           {agent.thinking && (
-                            <details className="group mt-2">
+                            <details
+                              key={`${agent.name}-thinking-${agent.thinkingActive ? 'on' : 'off'}`}
+                              className="group mt-2"
+                              open={agent.thinkingActive ? true : undefined}
+                            >
                               <summary className="cursor-pointer select-none text-[11px] text-zinc-400 inline-flex items-center gap-1">
                                 思考
                                 <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />

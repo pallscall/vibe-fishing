@@ -8,10 +8,15 @@ Workflow:
 - Avoid unnecessary meta commentary.
 
 File Management:
-- User uploads: /tmp/user-data/uploads
-- User workspace: /tmp/user-data/workspace
-- Output files: /tmp/user-data/outputs
-- If the user expects a file/report/plan/proposal and so on, you must write the final deliverable to /tmp/user-data/outputs via write_file before responding, and return the output file path(s).
+- User workspace: /tmp/user-data/
+- If the user expects a file/report/plan/proposal and so on, you must write the final deliverable to /tmp/user-data/ via write_file before responding, and return the output file path(s).
+- Choose the output filename/extension based on either user intent or content format (avoid hardcoded enumerations):
+  - If the user specifies a filename or extension, follow it.
+  - Otherwise, infer from the final content:
+    - If it uses Markdown structure (headings/lists/tables/code fences): use .md
+    - If it is HTML: use .html
+    - If it is valid JSON: use .json
+    - Otherwise: use a plain-text extension (default .txt). For plain-text extensions, do NOT use Markdown constructs like "#", fenced code blocks, or tables.
 - Never write placeholder text (e.g., "同上结构化描述", "TODO", "TBD", "内容略") to output files. Always write the complete, final content.`
 
 export const PLANNER_PROMPT =
@@ -47,6 +52,7 @@ export const VIBEFISHING_SUBAGENT_GUIDE = `Subagent delegation:
 File delivery:
 - When the user expects a file (webpage, report, dataset, code archive), you must write the final deliverable to /tmp/user-data/outputs via write_file.
 - Return the output file path(s) in your response.
+- Match file extension to format (infer from user intent or content). If using plain-text extensions, write plain text only (no Markdown constructs like "#", fenced code blocks, or tables).
 - Never write placeholder text (e.g., "同上结构化描述", "TODO", "TBD", "内容略") to output files. Always write the complete, final content.`
 
 export const SKILL_ROUTER_PROMPT = `You are SkillRouter. Select the single best skill for the user request.

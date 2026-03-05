@@ -51,7 +51,7 @@ const parseDockerHost = () => {
 
 const parseDockerMountData = () => {
   const raw = process.env.SANDBOX_DOCKER_MOUNT_DATA
-  if (raw === undefined) return false
+  if (raw === undefined) return true
   return raw.toLowerCase() === 'true'
 }
 
@@ -167,6 +167,20 @@ const ensureDir = (dir: string) => {
   }
 }
 
+const resolveStorageDir = () => {
+  const configured = process.env.THREAD_STORE_PATH
+  if (configured && configured.trim().length > 0) {
+    const raw = configured.trim()
+    const storePath = path.isAbsolute(raw) ? raw : path.resolve(process.cwd(), raw)
+    return path.dirname(storePath)
+  }
+  const direct = path.resolve(process.cwd(), 'storage')
+  if (fs.existsSync(direct)) return direct
+  const nested = path.resolve(process.cwd(), 'backend', 'storage')
+  if (fs.existsSync(nested)) return nested
+  return direct
+}
+
 const getFreePort = (): Promise<number> => {
   return new Promise((resolve, reject) => {
     const server = net.createServer()
@@ -235,7 +249,7 @@ export const createSandboxForThread = async (threadId: string): Promise<ThreadSa
     const hostPort = await getFreePort()
     const args = ['run', '-d', '--rm', '--name', name, '-p', `${hostPort}:${containerPort}`]
     if (parseDockerMountData()) {
-      const baseDir = path.resolve(process.cwd(), 'storage', 'sandbox', threadId, 'user-data')
+      const baseDir = path.join(resolveStorageDir(), 'threads', threadId, 'user-data')
       ensureDir(baseDir)
       args.push('-v', `${baseDir}:/tmp/user-data`)
     }

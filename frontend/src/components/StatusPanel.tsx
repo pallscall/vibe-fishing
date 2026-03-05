@@ -5,9 +5,10 @@ import { Wifi, WifiOff } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 const fetcher = (url: string) => fetch(url).then((res) => res.json())
+const API_BASE_URL = (process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:8000').replace(/\/+$/, '')
 
 export function StatusPanel() {
-  const { data: health, error } = useSWR('http://localhost:8000/health', fetcher)
+  const { data: health, error } = useSWR(`${API_BASE_URL}/health`, fetcher)
   const isConnected = !error && health;
 
   return (

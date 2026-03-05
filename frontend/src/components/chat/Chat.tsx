@@ -3,11 +3,13 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ChatList } from './ChatList';
 import { ChatInput } from './ChatInput';
-import { AgentTimelinePanel } from './AgentTimelinePanel';
 import { ToolTimelinePanel } from './ToolTimelinePanel';
 import { Message, ModelOption, ThreadState } from '@/lib/types';
 import { v4 as uuidv4 } from 'uuid';
-import { Download, Eye, Loader2, X } from 'lucide-react';
+import { Download, Eye, FileText, Folder, Globe, Loader2, Monitor, RefreshCcw, X } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import { cn } from '@/lib/utils';
 
 interface ChatProps {
   threadId: string | null;
@@ -19,12 +21,23 @@ type ToolTimelineItem = {
   name: string;
   serverName?: string;
   toolName?: string;
+  agentName?: string;
   status: 'running' | 'done' | 'error';
   durationMs?: number;
   args?: Record<string, unknown>;
   result?: string;
   error?: string;
 };
+
+type ArtifactItem = {
+  name: string;
+  size: number;
+  url: string;
+};
+
+type FileNode =
+  | { type: 'dir'; name: string; path: string; children: FileNode[] }
+  | { type: 'file'; name: string; path: string; artifact: ArtifactItem };
 
 const MODE_OPTIONS: Array<{ value: ChatMode; label: string; description: string }> = [
   { value: 'flash', label: 'Flash', description: '快速高效完成任务，但可能不够精准' },
@@ -33,6 +46,8 @@ const MODE_OPTIONS: Array<{ value: ChatMode; label: string; description: string 
   { value: 'ultra', label: 'Ultra', description: '继承自 Planner，可并行协作处理复杂任务，能力最强' },
   { value: 'vibefishing', label: 'Vibe Fishing', description: '规划 + 调研 + 执行协作，多代理协同模式' },
 ];
+
+const MAX_INLINE_BYTES = 2 * 1024 * 1024;
 
 export function Chat({ threadId }: ChatProps) {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -45,6 +60,22 @@ export function Chat({ threadId }: ChatProps) {
   const [threadError, setThreadError] = useState<string>('');
   const [sandboxUiUrl, setSandboxUiUrl] = useState<string>('');
   const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewTab, setPreviewTab] = useState<'files' | 'sandbox'>('files');
+  const [artifacts, setArtifacts] = useState<ArtifactItem[]>([]);
+  const [artifactsLoading, setArtifactsLoading] = useState(false);
+  const [artifactsError, setArtifactsError] = useState('');
+  const [expandedDirs, setExpandedDirs] = useState<string[]>([]);
+  const [selectedFilePath, setSelectedFilePath] = useState<string>('');
+  const [viewerMode, setViewerMode] = useState<'preview' | 'source'>('preview');
+  const [fileText, setFileText] = useState<string>('');
+  const [fileBinary, setFileBinary] = useState(false);
+  const [fileBase64, setFileBase64] = useState('');
+  const [fileContentType, setFileContentType] = useState('');
+  const [fileTruncated, setFileTruncated] = useState(false);
+  const [fileTotalBytes, setFileTotalBytes] = useState<number | null>(null);
+  const [fileTextLoading, setFileTextLoading] = useState(false);
+  const [fileTextError, setFileTextError] = useState('');
+  const [sourceCopied, setSourceCopied] = useState(false);
   const [downloadBusy, setDownloadBusy] = useState(false);
   const [downloadError, setDownloadError] = useState('');
   const [downloadAvailable, setDownloadAvailable] = useState<boolean | null>(null);
@@ -67,6 +98,186 @@ export function Chat({ threadId }: ChatProps) {
   const MODE_STORAGE_KEY = 'vibe_fishing_mode';
   const MODEL_STORAGE_KEY = 'vibe_fishing_model';
 
+  const API_BASE_URL = (process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:8000').replace(/\/+$/, '');
+  const apiUrl = (pathname: string) => {
+    const trimmed = pathname.trim();
+    if (!trimmed) return '';
+    if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) return trimmed;
+    return `${API_BASE_URL}${trimmed.startsWith('/') ? '' : '/'}${trimmed}`;
+  };
+
+  const normalizeArtifactUrl = (url: string) => {
+    const trimmed = url.trim();
+    if (!trimmed) return '';
+    if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) return trimmed;
+    if (trimmed.startsWith('/')) return apiUrl(trimmed);
+    return apiUrl(`/${trimmed}`);
+  };
+
+  const getExtension = (name: string) => {
+    const base = name.split('?')[0] ?? name;
+    const idx = base.lastIndexOf('.');
+    if (idx < 0) return '';
+    return base.slice(idx + 1).toLowerCase();
+  };
+
+  const isTextLikeExtension = (ext: string) => {
+    return (
+      ext === 'md' ||
+      ext === 'markdown' ||
+      ext === 'txt' ||
+      ext === 'log' ||
+      ext === 'csv' ||
+      ext === 'xml' ||
+      ext === 'json' ||
+      ext === 'html' ||
+      ext === 'htm' ||
+      ext === 'css' ||
+      ext === 'js' ||
+      ext === 'ts' ||
+      ext === 'tsx' ||
+      ext === 'jsx' ||
+      ext === 'py' ||
+      ext === 'go' ||
+      ext === 'rs' ||
+      ext === 'java' ||
+      ext === 'yml' ||
+      ext === 'yaml' ||
+      ext === 'toml'
+    );
+  };
+
+  const formatByteSize = (bytes: number) => {
+    if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  };
+
+  const isProbablyBinaryContent = (bytes: Uint8Array) => {
+    const max = Math.min(bytes.length, 4096);
+    if (max === 0) return false;
+    let suspicious = 0;
+    for (let i = 0; i < max; i += 1) {
+      const b = bytes[i]!;
+      if (b === 0) return true;
+      const isPrintableAscii = b === 9 || b === 10 || b === 13 || (b >= 32 && b <= 126);
+      if (!isPrintableAscii && b < 128) suspicious += 1;
+    }
+    return suspicious / max > 0.2;
+  };
+
+  const uint8ToBase64 = (bytes: Uint8Array) => {
+    if (bytes.length === 0) return '';
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const chunk = bytes.subarray(i, i + chunkSize);
+      const chars = new Array(chunk.length);
+      for (let j = 0; j < chunk.length; j += 1) {
+        chars[j] = String.fromCharCode(chunk[j]!);
+      }
+      binary += chars.join('');
+    }
+    return btoa(binary);
+  };
+
+  const readResponsePrefix = async (res: Response, limit: number) => {
+    const body = res.body;
+    if (!body) {
+      const buf = new Uint8Array(await res.arrayBuffer());
+      const truncated = buf.length > limit;
+      return { bytes: truncated ? buf.slice(0, limit) : buf, truncated };
+    }
+    const reader = body.getReader();
+    const chunks: Uint8Array[] = [];
+    let received = 0;
+    let truncated = false;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      if (received + value.length > limit) {
+        const need = limit - received;
+        if (need > 0) chunks.push(value.slice(0, need));
+        received = limit;
+        truncated = true;
+        try {
+          await reader.cancel();
+        } catch {
+        }
+        break;
+      }
+      chunks.push(value);
+      received += value.length;
+    }
+    const out = new Uint8Array(received);
+    let offset = 0;
+    for (let i = 0; i < chunks.length; i += 1) {
+      const chunk = chunks[i]!;
+      out.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return { bytes: out, truncated };
+  };
+
+  const prettifyJson = (value: string) => {
+    const trimmed = value.trim();
+    if (!trimmed) return '';
+    if (!(trimmed.startsWith('{') || trimmed.startsWith('['))) return value;
+    try {
+      return JSON.stringify(JSON.parse(trimmed), null, 2);
+    } catch {
+      return value;
+    }
+  };
+
+  const buildFileTree = (items: ArtifactItem[]): FileNode[] => {
+    const root: { children: FileNode[] } = { children: [] };
+
+    const upsertDir = (children: FileNode[], name: string, path: string) => {
+      const existing = children.find((node) => node.type === 'dir' && node.name === name) as
+        | { type: 'dir'; name: string; path: string; children: FileNode[] }
+        | undefined;
+      if (existing) return existing;
+      const created: FileNode = { type: 'dir', name, path, children: [] };
+      children.push(created);
+      children.sort((a, b) => {
+        if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+      return created as { type: 'dir'; name: string; path: string; children: FileNode[] };
+    };
+
+    for (const artifact of items) {
+      const parts = artifact.name.split('/').filter(Boolean);
+      if (parts.length === 0) continue;
+      let currentChildren = root.children;
+      let currentPath = '';
+      for (let i = 0; i < parts.length; i += 1) {
+        const part = parts[i]!;
+        const nextPath = currentPath ? `${currentPath}/${part}` : part;
+        const isLeaf = i === parts.length - 1;
+        if (isLeaf) {
+          const existing = currentChildren.find((node) => node.type === 'file' && node.path === nextPath);
+          if (existing) continue;
+          currentChildren.push({ type: 'file', name: part, path: nextPath, artifact });
+          currentChildren.sort((a, b) => {
+            if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
+            return a.name.localeCompare(b.name);
+          });
+        } else {
+          const dir = upsertDir(currentChildren, part, nextPath);
+          currentChildren = dir.children;
+          currentPath = nextPath;
+        }
+      }
+    }
+
+    return root.children;
+  };
+
   const isAbortError = (error: unknown) => {
     return error instanceof Error && (error.name === 'AbortError' || error.message.includes('aborted'));
   };
@@ -83,7 +294,7 @@ export function Chat({ threadId }: ChatProps) {
     let active = true;
     const loadModels = async () => {
       try {
-        const res = await fetch('http://localhost:8000/models');
+        const res = await fetch(apiUrl('/models'));
         if (!res.ok) {
           throw new Error('Failed to load models');
         }
@@ -113,7 +324,9 @@ export function Chat({ threadId }: ChatProps) {
 
   useEffect(() => {
     let active = true;
-    const url = threadId ? `http://localhost:8000/sandbox/info?threadId=${encodeURIComponent(threadId)}` : 'http://localhost:8000/sandbox/info';
+    const url = threadId
+      ? apiUrl(`/sandbox/info?threadId=${encodeURIComponent(threadId)}`)
+      : apiUrl('/sandbox/info');
     fetch(url)
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
@@ -184,21 +397,6 @@ export function Chat({ threadId }: ChatProps) {
     return assistantMessages.find((message) => message.id === selectedTimelineMessageId) ?? null;
   }, [assistantMessages, selectedTimelineMessageId, streamingMessage]);
 
-  const latestAgentTimeline = useMemo(() => {
-    if (selectedTimelineMessageId === 'streaming' && agentTimeline.length > 0) return agentTimeline;
-    const source = timelineSourceMessage;
-    if (!source) return [];
-    if (source.meta?.agentTimeline?.length) return source.meta.agentTimeline;
-    if (source.meta?.agents?.length) {
-      return source.meta.agents.map((agent) => ({
-        name: agent.name,
-        status: 'done' as const,
-        output: agent.output,
-      }));
-    }
-    return [];
-  }, [agentTimeline, selectedTimelineMessageId, timelineSourceMessage]);
-
   const latestToolTimeline = useMemo(() => {
     if (selectedTimelineMessageId === 'streaming' && toolTimeline.length > 0) return toolTimeline;
     const source = timelineSourceMessage;
@@ -241,12 +439,244 @@ export function Chat({ threadId }: ChatProps) {
     }
   }, [sandboxUiUrl]);
 
+  useEffect(() => {
+    if (!previewOpen) return;
+    setPreviewTab('files');
+    setViewerMode('preview');
+    setSourceCopied(false);
+  }, [previewOpen]);
+
+  useEffect(() => {
+    if (!previewOpen) return;
+    if (!threadId) {
+      setArtifacts([]);
+      setArtifactsError('缺少 threadId，无法加载产物列表');
+      return;
+    }
+    let active = true;
+    const run = async () => {
+      setArtifactsLoading(true);
+      setArtifactsError('');
+      try {
+        const res = await fetch(apiUrl(`/artifacts/${encodeURIComponent(threadId)}`));
+        if (!res.ok) throw new Error('Failed to load artifacts');
+        const data = await res.json();
+        if (!active) return;
+        const list = Array.isArray(data?.artifacts) ? (data.artifacts as ArtifactItem[]) : [];
+        const normalized = list
+          .map((item) => ({
+            name: typeof item?.name === 'string' ? item.name : '',
+            size: typeof item?.size === 'number' ? item.size : 0,
+            url: typeof item?.url === 'string' ? item.url : ''
+          }))
+          .filter((item) => item.name && item.url);
+        setArtifacts(normalized);
+      } catch {
+        if (!active) return;
+        setArtifacts([]);
+        setArtifactsError('产物列表加载失败');
+      } finally {
+        if (!active) return;
+        setArtifactsLoading(false);
+      }
+    };
+    run();
+    return () => {
+      active = false;
+    };
+  }, [previewOpen, threadId]);
+
+  const fileTree = useMemo(() => buildFileTree(artifacts), [artifacts]);
+
+  const selectedArtifact = useMemo(() => {
+    if (!selectedFilePath) return null;
+    return artifacts.find((a) => a.name === selectedFilePath) ?? null;
+  }, [artifacts, selectedFilePath]);
+
+  const selectedFileUrl = useMemo(() => {
+    const url = selectedArtifact?.url ?? '';
+    return url ? normalizeArtifactUrl(url) : '';
+  }, [selectedArtifact]);
+
+  const selectedExtension = useMemo(() => getExtension(selectedArtifact?.name ?? ''), [selectedArtifact]);
+
+  useEffect(() => {
+    if (!previewOpen) return;
+    if (selectedFilePath && artifacts.some((a) => a.name === selectedFilePath)) return;
+    if (artifacts.length === 0) {
+      setSelectedFilePath('');
+      return;
+    }
+    const preferred =
+      artifacts.find((a) => a.name.toLowerCase() === 'index.html') ??
+      artifacts.find((a) => a.name.toLowerCase() === 'readme.md') ??
+      artifacts.find((a) => getExtension(a.name) === 'html') ??
+      artifacts.find((a) => getExtension(a.name) === 'md') ??
+      artifacts[0]!;
+    setSelectedFilePath(preferred.name);
+  }, [previewOpen, artifacts, selectedFilePath]);
+
+  useEffect(() => {
+    if (!previewOpen) return;
+    if (!selectedFilePath) return;
+    const parts = selectedFilePath.split('/').filter(Boolean);
+    if (parts.length <= 1) return;
+    const prefixes: string[] = [];
+    for (let i = 0; i < parts.length - 1; i += 1) {
+      const prefix = prefixes.length === 0 ? parts[i]! : `${prefixes[prefixes.length - 1]!}/${parts[i]!}`;
+      prefixes.push(prefix);
+    }
+    setExpandedDirs((prev) => {
+      const set = new Set(prev);
+      prefixes.forEach((p) => set.add(p));
+      return Array.from(set);
+    });
+  }, [previewOpen, selectedFilePath]);
+
+  useEffect(() => {
+    if (!previewOpen) return;
+    setExpandedDirs((prev) => {
+      if (prev.length > 0) return prev;
+      const roots = fileTree.filter((n) => n.type === 'dir').map((n) => n.path);
+      return roots;
+    });
+  }, [previewOpen, fileTree]);
+
+  useEffect(() => {
+    if (!previewOpen) return;
+    setFileText('');
+    setFileBinary(false);
+    setFileBase64('');
+    setFileContentType('');
+    setFileTruncated(false);
+    setFileTotalBytes(null);
+    setFileTextError('');
+    setSourceCopied(false);
+    if (!selectedArtifact) return;
+    if (!selectedFileUrl) return;
+    const ext = getExtension(selectedArtifact.name);
+    const knownBinaryPreview =
+      ext === 'png' ||
+      ext === 'jpg' ||
+      ext === 'jpeg' ||
+      ext === 'gif' ||
+      ext === 'webp' ||
+      ext === 'svg' ||
+      ext === 'pdf' ||
+      ext === 'mp4' ||
+      ext === 'webm';
+    const shouldFetch =
+      viewerMode === 'source' ||
+      ext === 'md' ||
+      ext === 'markdown' ||
+      ext === 'json' ||
+      isTextLikeExtension(ext) ||
+      (!knownBinaryPreview && ext !== 'html' && ext !== 'htm');
+    if (!shouldFetch) return;
+    let active = true;
+    const run = async () => {
+      setFileTextLoading(true);
+      try {
+        const res = await fetch(selectedFileUrl);
+        if (!res.ok) throw new Error('Failed to load file');
+        const contentType = res.headers.get('Content-Type') ?? '';
+        const contentLength = res.headers.get('Content-Length') ?? '';
+        const parsedLength = Number.parseInt(contentLength, 10);
+        const totalBytes = Number.isFinite(parsedLength) ? parsedLength : null;
+        const prefix = await readResponsePrefix(res, MAX_INLINE_BYTES);
+        if (!active) return;
+        setFileContentType(contentType);
+        setFileTotalBytes(totalBytes ?? prefix.bytes.length);
+        const truncated = prefix.truncated || (totalBytes !== null ? totalBytes > prefix.bytes.length : false);
+        const view = prefix.bytes;
+        setFileTruncated(truncated);
+        const binary = isProbablyBinaryContent(view);
+        setFileBinary(binary);
+        if (!binary) {
+          const decoder = new TextDecoder('utf-8', { fatal: false });
+          setFileText(decoder.decode(view));
+        } else {
+          setFileBase64(uint8ToBase64(view));
+        }
+      } catch {
+        if (!active) return;
+        setFileText('');
+        setFileBinary(false);
+        setFileBase64('');
+        setFileContentType('');
+        setFileTruncated(false);
+        setFileTotalBytes(null);
+        setFileTextError('文件内容加载失败');
+      } finally {
+        if (!active) return;
+        setFileTextLoading(false);
+      }
+    };
+    run();
+    return () => {
+      active = false;
+    };
+  }, [previewOpen, selectedArtifact, selectedFileUrl, viewerMode]);
+
+  const toggleExpandedDir = (dirPath: string) => {
+    setExpandedDirs((prev) => (prev.includes(dirPath) ? prev.filter((p) => p !== dirPath) : [...prev, dirPath]));
+  };
+
+  const renderFileTree = (nodes: FileNode[], depth: number): React.ReactNode => {
+    return nodes.map((node) => {
+      const indent = depth * 12;
+      if (node.type === 'dir') {
+        const open = expandedDirs.includes(node.path);
+        return (
+          <div key={node.path}>
+            <button
+              type="button"
+              onClick={() => toggleExpandedDir(node.path)}
+              className={cn(
+                'w-full flex items-center gap-2 rounded-md px-2 py-1 text-left text-[12px] transition-colors',
+                'hover:bg-zinc-100 dark:hover:bg-zinc-800/50 text-zinc-700 dark:text-zinc-200'
+              )}
+              style={{ paddingLeft: 8 + indent }}
+            >
+              <span className={cn('transition-transform', open ? 'rotate-90' : '')}>›</span>
+              <Folder className="h-3.5 w-3.5 text-zinc-400" />
+              <span className="truncate">{node.name}</span>
+            </button>
+            {open ? <div>{renderFileTree(node.children, depth + 1)}</div> : null}
+          </div>
+        );
+      }
+
+      const active = node.path === selectedFilePath;
+      return (
+        <button
+          key={node.path}
+          type="button"
+          onClick={() => {
+            setSelectedFilePath(node.path);
+            setViewerMode('preview');
+          }}
+          className={cn(
+            'w-full flex items-center gap-2 rounded-md px-2 py-1 text-left text-[12px] transition-colors',
+            active
+              ? 'bg-zinc-100 dark:bg-zinc-800/60 text-zinc-900 dark:text-white'
+              : 'hover:bg-zinc-100 dark:hover:bg-zinc-800/50 text-zinc-700 dark:text-zinc-200'
+          )}
+          style={{ paddingLeft: 28 + indent }}
+        >
+          <FileText className="h-3.5 w-3.5 text-zinc-400" />
+          <span className="truncate">{node.name}</span>
+        </button>
+      );
+    });
+  };
+
   const downloadArtifacts = () => {
     if (!threadId) return;
     if (downloadBusy) return;
     setDownloadBusy(true);
     setDownloadError('');
-    const url = `http://localhost:8000/artifacts/${threadId}/download`;
+    const url = apiUrl(`/artifacts/${threadId}/download`);
     const iframe = document.createElement('iframe');
     iframe.style.display = 'none';
     iframe.src = url;
@@ -268,7 +698,7 @@ export function Chat({ threadId }: ChatProps) {
       };
     }
     setDownloadAvailable(null);
-    fetch(`http://localhost:8000/artifacts/${threadId}`)
+    fetch(apiUrl(`/artifacts/${threadId}`))
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (!active) return;
@@ -292,7 +722,7 @@ export function Chat({ threadId }: ChatProps) {
         return;
       }
       try {
-        const res = await fetch(`http://localhost:8000/threads/${threadId}`);
+        const res = await fetch(apiUrl(`/threads/${threadId}`));
         if (!res.ok) {
           throw new Error('Failed to load thread');
         }
@@ -359,6 +789,7 @@ export function Chat({ threadId }: ChatProps) {
           name: string;
           serverName?: string;
           toolName?: string;
+          agentName?: string;
           status: 'running' | 'done' | 'error';
           durationMs?: number;
           args?: Record<string, unknown>;
@@ -428,7 +859,7 @@ export function Chat({ threadId }: ChatProps) {
       setStreamingMessage(null);
     };
     try {
-      const response = await fetch('http://localhost:8000/chat/stream', {
+      const response = await fetch(apiUrl('/chat/stream'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -582,6 +1013,7 @@ export function Chat({ threadId }: ChatProps) {
           const name = (data as any)?.name;
           const serverName = (data as any)?.serverName;
           const toolName = (data as any)?.toolName;
+          const agentName = (data as any)?.agentName;
           const args = (data as any)?.args;
           if (typeof name === 'string' && name.length > 0) {
             ensureSection('tools');
@@ -601,6 +1033,7 @@ export function Chat({ threadId }: ChatProps) {
                 name,
                 serverName: typeof serverName === 'string' ? serverName : item.serverName,
                 toolName: typeof toolName === 'string' ? toolName : item.toolName,
+                agentName: typeof agentName === 'string' ? agentName : (item as any).agentName,
                 args: typeof args === 'object' ? ({ ...(item.args ?? {}), ...(args as Record<string, unknown>) } as Record<string, unknown>) : item.args,
               };
             });
@@ -613,6 +1046,7 @@ export function Chat({ threadId }: ChatProps) {
                   name,
                   serverName: typeof serverName === 'string' ? serverName : undefined,
                   toolName: typeof toolName === 'string' ? toolName : undefined,
+                  agentName: typeof agentName === 'string' ? agentName : undefined,
                   status: 'running',
                   args: typeof args === 'object' ? (args as Record<string, unknown>) : undefined,
                 },
@@ -634,6 +1068,7 @@ export function Chat({ threadId }: ChatProps) {
                 name,
                 serverName: typeof serverName === 'string' ? serverName : undefined,
                 toolName: typeof toolName === 'string' ? toolName : undefined,
+                agentName: typeof agentName === 'string' ? agentName : undefined,
                 status: 'running',
                 args: typeof args === 'object' ? (args as Record<string, unknown>) : undefined,
               };
@@ -648,6 +1083,7 @@ export function Chat({ threadId }: ChatProps) {
                             callId: nextItem.callId ?? item.callId,
                             serverName: nextItem.serverName ?? item.serverName,
                             toolName: nextItem.toolName ?? item.toolName,
+                            agentName: nextItem.agentName ?? item.agentName,
                             args:
                               typeof args === 'object'
                                 ? ({ ...(item.args ?? {}), ...(args as Record<string, unknown>) } as Record<string, unknown>)
@@ -679,6 +1115,7 @@ export function Chat({ threadId }: ChatProps) {
           const ok = (data as any)?.ok;
           const result = (data as any)?.result;
           const error = (data as any)?.error;
+          const agentName = (data as any)?.agentName;
           if (typeof name === 'string' && name.length > 0) {
             ensureSection('tools');
             const matchId = typeof callId === 'string' && callId.length > 0 ? callId : undefined;
@@ -693,6 +1130,7 @@ export function Chat({ threadId }: ChatProps) {
               return {
                 ...item,
                 status,
+                agentName: typeof agentName === 'string' ? agentName : (item as any).agentName,
                 durationMs: typeof durationMs === 'number' ? durationMs : item.durationMs,
                 result: typeof result === 'string' ? result : item.result,
                 error: typeof error === 'string' ? error : item.error,
@@ -705,6 +1143,7 @@ export function Chat({ threadId }: ChatProps) {
                   type: 'tool',
                   callId: matchId,
                   name,
+                  agentName: typeof agentName === 'string' ? agentName : undefined,
                   status,
                   durationMs: typeof durationMs === 'number' ? durationMs : undefined,
                   result: typeof result === 'string' ? result : undefined,
@@ -736,6 +1175,7 @@ export function Chat({ threadId }: ChatProps) {
                             durationMs: typeof durationMs === 'number' ? durationMs : item.durationMs,
                             result: typeof result === 'string' ? result : item.result,
                             error: typeof error === 'string' ? error : item.error,
+                            agentName: typeof agentName === 'string' ? agentName : item.agentName,
                           }
                     )
                   : [
@@ -744,6 +1184,7 @@ export function Chat({ threadId }: ChatProps) {
                         callId: typeof callId === 'string' ? callId : undefined,
                         name,
                         status,
+                        agentName: typeof agentName === 'string' ? agentName : undefined,
                         durationMs: typeof durationMs === 'number' ? durationMs : undefined,
                         result: typeof result === 'string' ? result : undefined,
                         error: typeof error === 'string' ? error : undefined,
@@ -1304,7 +1745,7 @@ export function Chat({ threadId }: ChatProps) {
               onClick={() => setAgentPanelOpen(true)}
               className="h-9 px-3 rounded-lg border border-zinc-200/70 dark:border-zinc-700/70 text-xs font-medium shadow-sm transition-colors bg-white/80 dark:bg-zinc-900/70 text-zinc-700 dark:text-zinc-200 hover:bg-white dark:hover:bg-zinc-800"
             >
-              Agent
+              Timeline
             </button>
           )}
           <button
@@ -1364,11 +1805,11 @@ export function Chat({ threadId }: ChatProps) {
               type="button"
               className="absolute inset-0 bg-black/20 dark:bg-black/40"
               onClick={() => setAgentPanelOpen(false)}
-              aria-label="Close agent panel"
+              aria-label="Close timeline panel"
             />
             <div className="absolute right-0 top-0 h-full w-full max-w-[520px] border-l border-zinc-200/70 dark:border-zinc-800/70 bg-white/95 dark:bg-zinc-950/90 backdrop-blur-xl shadow-2xl flex flex-col">
               <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-200/70 dark:border-zinc-800/70">
-                <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Agent</div>
+                <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Timeline</div>
                 <button
                   type="button"
                   className="h-8 w-8 rounded-lg border border-zinc-200/70 dark:border-zinc-700/70 text-zinc-500 dark:text-zinc-300 hover:text-zinc-700 dark:hover:text-white hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
@@ -1403,7 +1844,6 @@ export function Chat({ threadId }: ChatProps) {
               </div>
               <div className="flex-1 overflow-auto p-4">
                 <div className="space-y-4">
-                  <AgentTimelinePanel items={latestAgentTimeline} />
                   <ToolTimelinePanel items={latestToolTimeline} />
                 </div>
               </div>
@@ -1420,7 +1860,36 @@ export function Chat({ threadId }: ChatProps) {
             />
             <div className="absolute right-0 top-0 h-full w-full max-w-[920px] border-l border-zinc-200/70 dark:border-zinc-800/70 bg-white/95 dark:bg-zinc-950/90 backdrop-blur-xl shadow-2xl flex flex-col">
               <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-200/70 dark:border-zinc-800/70">
-                <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">预览</div>
+                <div className="flex items-center gap-2">
+                  <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">预览</div>
+                  <div className="flex items-center rounded-lg border border-zinc-200/70 dark:border-zinc-800/70 bg-white/70 dark:bg-zinc-950/50 p-0.5">
+                    <button
+                      type="button"
+                      onClick={() => setPreviewTab('files')}
+                      className={cn(
+                        'h-7 px-2.5 rounded-md text-xs font-medium transition-colors',
+                        previewTab === 'files'
+                          ? 'bg-zinc-900 text-white dark:bg-white dark:text-zinc-900'
+                          : 'text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800/60'
+                      )}
+                    >
+                      Files
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPreviewTab('sandbox')}
+                      className={cn(
+                        'h-7 px-2.5 rounded-md text-xs font-medium transition-colors flex items-center gap-1',
+                        previewTab === 'sandbox'
+                          ? 'bg-zinc-900 text-white dark:bg-white dark:text-zinc-900'
+                          : 'text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800/60'
+                      )}
+                    >
+                      <Monitor className="h-3.5 w-3.5" />
+                      Sandbox
+                    </button>
+                  </div>
+                </div>
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
@@ -1453,19 +1922,262 @@ export function Chat({ threadId }: ChatProps) {
                   {downloadError}
                 </div>
               ) : null}
-              {sandboxPreviewUrl ? (
-                <div className="flex-1 min-h-0">
-                  <iframe
-                    className="w-full h-full bg-white dark:bg-zinc-950"
-                    sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-presentation"
-                    src={sandboxPreviewUrl}
-                    title="Sandbox Preview"
-                  />
-                </div>
+              {previewTab === 'sandbox' ? (
+                sandboxPreviewUrl ? (
+                  <div className="flex-1 min-h-0">
+                    <iframe
+                      className="w-full h-full bg-white dark:bg-zinc-950"
+                      sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-presentation"
+                      src={sandboxPreviewUrl}
+                      title="Sandbox Preview"
+                    />
+                  </div>
+                ) : (
+                  <div className="flex-1 flex flex-col items-center justify-center gap-2 text-xs text-zinc-400">
+                    <div>未配置 Sandbox UI</div>
+                    <div className="text-[11px] text-zinc-400/80">请设置 SANDBOX_UI_URL 或 SANDBOX_API_URL</div>
+                  </div>
+                )
               ) : (
-                <div className="flex-1 flex flex-col items-center justify-center gap-2 text-xs text-zinc-400">
-                  <div>未配置 Sandbox UI</div>
-                  <div className="text-[11px] text-zinc-400/80">请设置 SANDBOX_UI_URL 或 SANDBOX_API_URL</div>
+                <div className="flex-1 min-h-0 flex">
+                  <div className="w-[280px] border-r border-zinc-200/70 dark:border-zinc-800/70 bg-white/60 dark:bg-zinc-950/30">
+                    <div className="flex items-center justify-between px-3 py-2 border-b border-zinc-200/60 dark:border-zinc-800/60">
+                      <div className="text-[11px] font-medium text-zinc-600 dark:text-zinc-300">产物文件</div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (!previewOpen) return;
+                          if (!threadId) return;
+                          setArtifactsLoading(true);
+                          setArtifactsError('');
+                          fetch(apiUrl(`/artifacts/${encodeURIComponent(threadId)}`))
+                            .then((res) => (res.ok ? res.json() : null))
+                            .then((data) => {
+                              const list = Array.isArray(data?.artifacts) ? (data.artifacts as ArtifactItem[]) : [];
+                              const normalized = list
+                                .map((item) => ({
+                                  name: typeof item?.name === 'string' ? item.name : '',
+                                  size: typeof item?.size === 'number' ? item.size : 0,
+                                  url: typeof item?.url === 'string' ? item.url : ''
+                                }))
+                                .filter((item) => item.name && item.url);
+                              setArtifacts(normalized);
+                            })
+                            .catch(() => {
+                              setArtifacts([]);
+                              setArtifactsError('产物列表加载失败');
+                            })
+                            .finally(() => {
+                              setArtifactsLoading(false);
+                            });
+                        }}
+                        className="h-7 w-7 inline-flex items-center justify-center rounded-md border border-zinc-200/70 dark:border-zinc-800/70 text-zinc-500 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800/60 transition-colors"
+                        aria-label="刷新"
+                      >
+                        <RefreshCcw className={cn('h-3.5 w-3.5', artifactsLoading ? 'animate-spin' : '')} />
+                      </button>
+                    </div>
+                    {artifactsError ? (
+                      <div className="px-3 py-2 text-[11px] text-rose-500">{artifactsError}</div>
+                    ) : null}
+                    <div className="p-2 overflow-auto h-full">
+                      {artifactsLoading && artifacts.length === 0 ? (
+                        <div className="px-2 py-6 text-center text-[11px] text-zinc-400">加载中…</div>
+                      ) : artifacts.length === 0 ? (
+                        <div className="px-2 py-6 text-center text-[11px] text-zinc-400">暂无产物</div>
+                      ) : (
+                        <div className="space-y-0.5">{renderFileTree(fileTree, 0)}</div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex-1 min-w-0 flex flex-col">
+                    <div className="px-4 py-2 border-b border-zinc-200/70 dark:border-zinc-800/70 flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="text-[12px] font-medium text-zinc-800 dark:text-zinc-100 truncate">
+                          {selectedArtifact?.name || '选择一个文件'}
+                        </div>
+                        {selectedArtifact?.url ? (
+                          <div className="text-[10px] text-zinc-400 truncate">{normalizeArtifactUrl(selectedArtifact.url)}</div>
+                        ) : null}
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <div className="flex items-center rounded-lg border border-zinc-200/70 dark:border-zinc-800/70 bg-white/70 dark:bg-zinc-950/50 p-0.5">
+                          <button
+                            type="button"
+                            onClick={() => setViewerMode('preview')}
+                            className={cn(
+                              'h-7 px-2.5 rounded-md text-xs font-medium transition-colors',
+                              viewerMode === 'preview'
+                                ? 'bg-zinc-900 text-white dark:bg-white dark:text-zinc-900'
+                                : 'text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800/60'
+                            )}
+                            disabled={!selectedArtifact}
+                          >
+                            Preview
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setViewerMode('source')}
+                            className={cn(
+                              'h-7 px-2.5 rounded-md text-xs font-medium transition-colors',
+                              viewerMode === 'source'
+                                ? 'bg-zinc-900 text-white dark:bg-white dark:text-zinc-900'
+                                : 'text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800/60'
+                            )}
+                            disabled={!selectedArtifact}
+                          >
+                            Source
+                          </button>
+                        </div>
+                        {selectedFileUrl ? (
+                          <a
+                            href={selectedFileUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="h-7 px-2 rounded-lg border border-zinc-200/70 dark:border-zinc-800/70 text-[11px] font-medium text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800/60 transition-colors inline-flex items-center gap-1"
+                          >
+                            <Globe className="h-3.5 w-3.5" />
+                            打开
+                          </a>
+                        ) : null}
+                        {selectedArtifact?.url ? (
+                          <a
+                            href={`${normalizeArtifactUrl(selectedArtifact.url)}?download=true`}
+                            className="h-7 px-2 rounded-lg border border-zinc-200/70 dark:border-zinc-800/70 text-[11px] font-medium text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800/60 transition-colors inline-flex items-center gap-1"
+                          >
+                            <Download className="h-3.5 w-3.5" />
+                            下载
+                          </a>
+                        ) : null}
+                      </div>
+                    </div>
+
+                    <div className="flex-1 min-h-0 overflow-auto p-4">
+                      {!selectedArtifact ? (
+                        <div className="h-full flex items-center justify-center text-xs text-zinc-400">请选择左侧文件</div>
+                      ) : viewerMode === 'preview' ? (
+                        selectedExtension === 'md' || selectedExtension === 'markdown' ? (
+                          fileTextLoading ? (
+                            <div className="h-full flex items-center justify-center text-xs text-zinc-400">加载中…</div>
+                          ) : fileTextError ? (
+                            <div className="h-full flex items-center justify-center text-xs text-rose-500">{fileTextError}</div>
+                          ) : (
+                            <div className="prose prose-sm dark:prose-invert max-w-none break-words">
+                              <ReactMarkdown remarkPlugins={[remarkGfm]}>{fileText}</ReactMarkdown>
+                            </div>
+                          )
+                        ) : selectedExtension === 'html' || selectedExtension === 'htm' ? (
+                          selectedFileUrl ? (
+                            <div className="h-full min-h-[480px] rounded-xl border border-zinc-200/70 dark:border-zinc-800/70 overflow-hidden bg-white dark:bg-zinc-950">
+                              <iframe
+                                className="w-full h-full"
+                                sandbox="allow-scripts allow-forms allow-popups allow-presentation"
+                                src={selectedFileUrl}
+                                title="HTML Preview"
+                              />
+                            </div>
+                          ) : (
+                            <div className="h-full flex items-center justify-center text-xs text-zinc-400">缺少文件地址</div>
+                          )
+                        ) : selectedExtension === 'png' ||
+                          selectedExtension === 'jpg' ||
+                          selectedExtension === 'jpeg' ||
+                          selectedExtension === 'gif' ||
+                          selectedExtension === 'webp' ||
+                          selectedExtension === 'svg' ? (
+                          selectedFileUrl ? (
+                            <div className="w-full">
+                              <img
+                                src={selectedFileUrl}
+                                alt={selectedArtifact.name}
+                                className="max-w-full rounded-xl border border-zinc-200/70 dark:border-zinc-800/70 bg-white dark:bg-zinc-950"
+                              />
+                            </div>
+                          ) : (
+                            <div className="h-full flex items-center justify-center text-xs text-zinc-400">缺少文件地址</div>
+                          )
+                        ) : selectedExtension === 'pdf' ? (
+                          selectedFileUrl ? (
+                            <div className="h-full min-h-[480px] rounded-xl border border-zinc-200/70 dark:border-zinc-800/70 overflow-hidden bg-white dark:bg-zinc-950">
+                              <iframe className="w-full h-full" src={selectedFileUrl} title="PDF Preview" />
+                            </div>
+                          ) : (
+                            <div className="h-full flex items-center justify-center text-xs text-zinc-400">缺少文件地址</div>
+                          )
+                        ) : selectedExtension === 'json' ? (
+                          fileTextLoading ? (
+                            <div className="h-full flex items-center justify-center text-xs text-zinc-400">加载中…</div>
+                          ) : fileTextError ? (
+                            <div className="h-full flex items-center justify-center text-xs text-rose-500">{fileTextError}</div>
+                          ) : (
+                            <pre className="whitespace-pre-wrap break-words text-[12px] leading-relaxed font-mono text-zinc-700 dark:text-zinc-200">
+                              {prettifyJson(fileText)}
+                            </pre>
+                          )
+                        ) : (
+                          fileTextLoading ? (
+                            <div className="h-full flex items-center justify-center text-xs text-zinc-400">加载中…</div>
+                          ) : fileTextError ? (
+                            <div className="h-full flex items-center justify-center text-xs text-rose-500">{fileTextError}</div>
+                          ) : (
+                            <div className="space-y-2">
+                              {fileTruncated ? (
+                                <div className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                                  仅展示前 {formatByteSize(MAX_INLINE_BYTES)}
+                                  {fileTotalBytes ? ` / 总计 ${formatByteSize(fileTotalBytes)}` : ''}
+                                  {fileContentType ? ` · ${fileContentType}` : ''}
+                                </div>
+                              ) : fileContentType || fileTotalBytes ? (
+                                <div className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                                  {fileTotalBytes ? formatByteSize(fileTotalBytes) : ''}
+                                  {fileContentType ? `${fileTotalBytes ? ' · ' : ''}${fileContentType}` : ''}
+                                </div>
+                              ) : null}
+                              <pre className="whitespace-pre-wrap break-words text-[12px] leading-relaxed font-mono text-zinc-700 dark:text-zinc-200">
+                                {fileBinary ? fileBase64 : fileText}
+                              </pre>
+                            </div>
+                          )
+                        )
+                      ) : (
+                        <div className="space-y-3">
+                          <div className="flex items-center justify-between">
+                            <div className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                              {fileBinary ? '二进制源码（base64）' : '文本源码'}
+                              {fileTruncated ? `（仅展示前 ${formatByteSize(MAX_INLINE_BYTES)}）` : ''}
+                            </div>
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                try {
+                                  const payload = fileBinary ? fileBase64 : fileText;
+                                  await navigator.clipboard.writeText(payload);
+                                  setSourceCopied(true);
+                                  window.setTimeout(() => setSourceCopied(false), 1200);
+                                } catch {
+                                  setSourceCopied(false);
+                                }
+                              }}
+                              className="h-7 px-2 rounded-lg border border-zinc-200/70 dark:border-zinc-800/70 text-[11px] font-medium text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800/60 transition-colors"
+                              disabled={fileTextLoading || !!fileTextError}
+                            >
+                              {sourceCopied ? 'Copied' : 'Copy'}
+                            </button>
+                          </div>
+                          {fileTextLoading ? (
+                            <div className="h-[240px] flex items-center justify-center text-xs text-zinc-400">加载中…</div>
+                          ) : fileTextError ? (
+                            <div className="h-[240px] flex items-center justify-center text-xs text-rose-500">{fileTextError}</div>
+                          ) : (
+                            <pre className="whitespace-pre-wrap break-words text-[12px] leading-relaxed font-mono text-zinc-700 dark:text-zinc-200">
+                              {fileBinary ? fileBase64 : fileText}
+                            </pre>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
                 </div>
               )}
             </div>

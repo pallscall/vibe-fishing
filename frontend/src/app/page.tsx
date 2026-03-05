@@ -8,6 +8,8 @@ import { Plus, MessageSquare, Menu, Settings, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { ThreadSummary } from '@/lib/types'
 
+const API_BASE_URL = (process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:8000').replace(/\/+$/, '')
+
 export default function Home() {
   const [chatKey, setChatKey] = useState(0)
   const [threads, setThreads] = useState<ThreadSummary[]>([])
@@ -16,7 +18,7 @@ export default function Home() {
 
   const loadThreads = useCallback(async () => {
     try {
-      const res = await fetch('http://localhost:8000/threads')
+      const res = await fetch(`${API_BASE_URL}/threads`)
       if (!res.ok) {
         throw new Error('Failed to load threads')
       }
@@ -33,7 +35,7 @@ export default function Home() {
   }, [activeThreadId])
 
   const createThread = useCallback(async () => {
-    const res = await fetch('http://localhost:8000/threads', { method: 'POST' })
+    const res = await fetch(`${API_BASE_URL}/threads`, { method: 'POST' })
     if (!res.ok) {
       throw new Error('Failed to create thread')
     }
@@ -79,7 +81,7 @@ export default function Home() {
 
   const handleDeleteThread = async (threadId: string) => {
     try {
-      const res = await fetch(`http://localhost:8000/threads/${threadId}`, { method: 'DELETE' })
+      const res = await fetch(`${API_BASE_URL}/threads/${threadId}`, { method: 'DELETE' })
       if (!res.ok) {
         throw new Error('Failed to delete thread')
       }
