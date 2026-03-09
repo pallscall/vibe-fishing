@@ -3,6 +3,7 @@ export interface Message {
   role: 'user' | 'assistant' | 'system';
   content: string;
   meta?: {
+    todoState?: TodoState | null;
     plan?: string | null;
     research?: string | null;
     analysis?: string | null;
@@ -83,6 +84,34 @@ export interface Message {
     }>;
   };
   createdAt: number;
+}
+
+export type TodoStatus = 'pending' | 'in_progress' | 'completed' | 'blocked' | 'canceled';
+export type TodoPriority = 'high' | 'medium' | 'low';
+
+export interface TodoItem {
+  id: string;
+  content: string;
+  status: TodoStatus;
+  priority: TodoPriority;
+  deps?: string[];
+  createdAt: number;
+  updatedAt: number;
+  lastError?: string;
+  toolHints?: {
+    tool?: string;
+    args?: Record<string, unknown>;
+  };
+}
+
+export interface TodoState {
+  runId: string;
+  items: TodoItem[];
+  policy: {
+    maxInProgress: number;
+    maxSteps: number;
+  };
+  updatedAt: number;
 }
 
 export interface ModelOption {

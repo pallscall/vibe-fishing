@@ -8,6 +8,7 @@ export interface ThreadMessage {
   content: string
   meta?: {
     thinking?: string | null
+    todoState?: TodoState | null
     skills?: string[]
     tools?: string[]
     tokenUsage?: {
@@ -84,12 +85,41 @@ export interface ThreadSandboxState {
   createdAt: number
 }
 
+export type TodoStatus = 'pending' | 'in_progress' | 'completed' | 'blocked' | 'canceled'
+export type TodoPriority = 'high' | 'medium' | 'low'
+
+export interface TodoItem {
+  id: string
+  content: string
+  status: TodoStatus
+  priority: TodoPriority
+  deps?: string[]
+  createdAt: number
+  updatedAt: number
+  lastError?: string
+  toolHints?: {
+    tool?: string
+    args?: Record<string, unknown>
+  }
+}
+
+export interface TodoState {
+  runId: string
+  items: TodoItem[]
+  policy: {
+    maxInProgress: number
+    maxSteps: number
+  }
+  updatedAt: number
+}
+
 export interface ThreadState {
   id: string
   title: string
   messages: ThreadMessage[]
   summary: string | null
   sandbox?: ThreadSandboxState | null
+  todoState?: TodoState | null
   createdAt: number
   updatedAt: number
 }
@@ -141,6 +171,10 @@ const loadThreads = () => {
         sandbox:
           thread.sandbox && typeof thread.sandbox === 'object'
             ? (thread.sandbox as ThreadSandboxState)
+            : null,
+        todoState:
+          (thread as any).todoState && typeof (thread as any).todoState === 'object'
+            ? ((thread as any).todoState as TodoState)
             : null,
         createdAt: thread.createdAt,
         updatedAt: thread.updatedAt
@@ -210,6 +244,7 @@ export const createThreadWithId = (id: string, sandbox: ThreadSandboxState | nul
     messages: [],
     summary: null,
     sandbox,
+    todoState: null,
     createdAt: now,
     updatedAt: now
   }
@@ -251,6 +286,16 @@ export const updateThreadSummary = (
   if (!thread) return null
   thread.summary = summary
   thread.messages = messages
+  thread.updatedAt = Date.now()
+  persistThreads()
+  return thread
+}
+
+export const updateThreadTodoState = (threadId: string, todoState: TodoState | null) => {
+  purgeExpiredThreads()
+  const thread = threads.get(threadId)
+  if (!thread) return null
+  thread.todoState = todoState
   thread.updatedAt = Date.now()
   persistThreads()
   return thread

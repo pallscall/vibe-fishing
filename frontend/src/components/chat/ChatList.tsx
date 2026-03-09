@@ -12,7 +12,7 @@ interface ChatListProps {
   isLoading?: boolean;
   streamingMessage?: Message | null;
   isSidePanelOpen?: boolean;
-  mode?: 'flash' | 'thinking' | 'pro' | 'ultra' | 'vibefishing';
+  mode?: 'flash' | 'thinking' | 'pro' | 'ultra' | 'vibefishing' | 'todo';
 }
 
 const getToolIcon = (name: string) => {

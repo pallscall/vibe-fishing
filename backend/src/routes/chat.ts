@@ -17,7 +17,18 @@ import {
   SUBAGENT_PROMPT,
   VIBEFISHING_SUBAGENT_GUIDE
 } from '../prompts/chatPrompts'
-import { appendMessage, createThreadWithId, getThread, updateThreadSandbox, updateThreadSummary } from '../store/threads'
+import {
+  appendMessage,
+  createThreadWithId,
+  getThread,
+  updateThreadSandbox,
+  updateThreadSummary,
+  updateThreadTodoState,
+  type TodoItem,
+  type TodoPriority,
+  type TodoState,
+  type TodoStatus
+} from '../store/threads'
 import { saveFileArtifact, saveTextArtifact } from '../store/artifacts'
 import { getSkillByName, loadSkills, resolveSkillsPath, type SkillDefinition } from '../skills/loader'
 import { executeMcpTool, loadMcpToolset, type OpenAiToolDefinition } from '../mcp/tools'
@@ -39,7 +50,7 @@ const ChatRequestSchema = z.object({
   modelId: z.string().optional(),
   threadId: z.string().optional(),
   multiAgent: z.boolean().optional(),
-  mode: z.enum(['flash', 'thinking', 'pro', 'ultra', 'vibefishing']).optional()
+  mode: z.enum(['flash', 'thinking', 'pro', 'ultra', 'vibefishing', 'todo']).optional()
 })
 
 const resolveDefaultModel = () => {
@@ -2958,10 +2969,480 @@ const getThinkingRequestExtras = (model: ModelConfig) => {
   return model.whenThinkingEnabled
 }
 
-const resolveModeFlags = (mode: 'flash' | 'thinking' | 'pro' | 'ultra' | 'vibefishing' | undefined) => {
+const resolveModeFlags = (mode: 'flash' | 'thinking' | 'pro' | 'ultra' | 'vibefishing' | 'todo' | undefined) => {
   const isPro = mode === 'pro' || mode === 'ultra'
   const thinkingEnabled = mode !== 'flash'
   return { isPro, thinkingEnabled }
+}
+
+const parseTodoMaxSteps = () => {
+  const raw = process.env.TODO_MAX_STEPS
+  const parsed = raw ? Number.parseInt(raw, 10) : 8
+  if (!Number.isFinite(parsed) || parsed <= 0) return 8
+  return Math.min(50, parsed)
+}
+
+const TodoStatusSchema = z.enum(['pending', 'in_progress', 'completed', 'blocked', 'canceled'])
+const TodoPrioritySchema = z.enum(['high', 'medium', 'low'])
+const TodoToolHintsSchema = z
+  .object({
+    tool: z.string().min(1).optional(),
+    args: z.record(z.unknown()).optional()
+  })
+  .optional()
+
+const TodoPatchSchema = z.object({
+  ops: z.array(
+    z.discriminatedUnion('op', [
+      z.object({
+        op: z.literal('add'),
+        item: z.object({
+          content: z.string().min(1),
+          priority: TodoPrioritySchema.optional(),
+          deps: z.array(z.string().min(1)).optional(),
+          toolHints: TodoToolHintsSchema
+        })
+      }),
+      z.object({
+        op: z.literal('update'),
+        id: z.string().min(1),
+        patch: z
+          .object({
+            content: z.string().min(1).optional(),
+            status: TodoStatusSchema.optional(),
+            priority: TodoPrioritySchema.optional(),
+            deps: z.array(z.string().min(1)).optional(),
+            lastError: z.string().optional(),
+            toolHints: TodoToolHintsSchema
+          })
+          .strict()
+      }),
+      z.object({
+        op: z.literal('cancel'),
+        id: z.string().min(1),
+        reason: z.string().optional()
+      })
+    ])
+  )
+})
+
+const extractJsonObjectText = (raw: string) => {
+  const trimmed = raw.trim()
+  if (!trimmed) return null
+  const withoutFences = trimmed.replace(/```(?:json)?/g, '').replace(/```/g, '').trim()
+  const first = withoutFences.indexOf('{')
+  const last = withoutFences.lastIndexOf('}')
+  if (first === -1 || last === -1 || last <= first) return null
+  return withoutFences.slice(first, last + 1)
+}
+
+const coerceTodoPriority = (value: unknown): TodoPriority => {
+  if (value === 'high' || value === 'medium' || value === 'low') return value
+  return 'medium'
+}
+
+const normalizeTodoContent = (raw: string, maxChars = 32) => {
+  const trimmed = raw.trim().replace(/\s+/g, ' ')
+  if (!trimmed) return ''
+  if (trimmed.length <= maxChars) return trimmed
+  return trimmed.slice(0, maxChars).trim()
+}
+
+const buildDefaultTodoState = (): TodoState => {
+  const now = Date.now()
+  return {
+    runId: randomUUID(),
+    items: [],
+    policy: { maxInProgress: 1, maxSteps: parseTodoMaxSteps() },
+    updatedAt: now
+  }
+}
+
+const applyTodoPatch = (state: TodoState, patch: z.infer<typeof TodoPatchSchema>) => {
+  const now = Date.now()
+  const byId = new Map(state.items.map((item) => [item.id, item] as const))
+  const nextItems: TodoItem[] = state.items.map((item) => ({ ...item }))
+  const errors: string[] = []
+
+  const setItem = (id: string, updater: (prev: TodoItem) => TodoItem) => {
+    const index = nextItems.findIndex((item) => item.id === id)
+    if (index < 0) {
+      errors.push(`Unknown todo id: ${id}`)
+      return
+    }
+    const updated = updater(nextItems[index])
+    nextItems[index] = { ...updated, updatedAt: now }
+  }
+
+  for (const op of patch.ops) {
+    if (op.op === 'add') {
+      const id = randomUUID()
+      const content = normalizeTodoContent(op.item.content, 32)
+      if (!content) {
+        errors.push('Todo content is empty')
+        continue
+      }
+      nextItems.push({
+        id,
+        content,
+        status: 'pending',
+        priority: coerceTodoPriority(op.item.priority),
+        deps: Array.isArray(op.item.deps) ? op.item.deps : [],
+        toolHints: op.item.toolHints,
+        createdAt: now,
+        updatedAt: now
+      })
+      continue
+    }
+    if (op.op === 'cancel') {
+      setItem(op.id, (prev) => ({
+        ...prev,
+        status: 'canceled',
+        lastError: op.reason ? op.reason.trim() : prev.lastError
+      }))
+      continue
+    }
+    if (op.op === 'update') {
+      setItem(op.id, (prev) => {
+        const next: TodoItem = { ...prev }
+        if (typeof op.patch.content === 'string') {
+          const normalized = normalizeTodoContent(op.patch.content, 32)
+          if (normalized) next.content = normalized
+        }
+        if (op.patch.status) next.status = op.patch.status as TodoStatus
+        if (op.patch.priority) next.priority = op.patch.priority as TodoPriority
+        if (Array.isArray(op.patch.deps)) next.deps = op.patch.deps
+        if (typeof op.patch.lastError === 'string') next.lastError = op.patch.lastError
+        if (op.patch.toolHints) next.toolHints = op.patch.toolHints
+        return next
+      })
+    }
+  }
+
+  const maxInProgress = state.policy?.maxInProgress ?? 1
+  const inProgress = nextItems.filter((item) => item.status === 'in_progress')
+  if (inProgress.length > maxInProgress) {
+    errors.push(`Too many in_progress todos: ${inProgress.length}`)
+  }
+
+  const immutableStatuses = new Set<TodoStatus>(['completed', 'canceled'])
+  for (const original of state.items) {
+    if (!immutableStatuses.has(original.status)) continue
+    const updated = nextItems.find((item) => item.id === original.id)
+    if (!updated) continue
+    if (updated.status !== original.status) {
+      errors.push(`Cannot change status of ${original.id} from ${original.status}`)
+    }
+  }
+
+  const allIds = new Set(nextItems.map((item) => item.id))
+  for (let index = 0; index < nextItems.length; index += 1) {
+    const item = nextItems[index]
+    const deps = Array.isArray(item.deps) ? item.deps : []
+    const missing = deps.filter((dep) => !allIds.has(dep))
+    if (missing.length === 0) continue
+    const filtered = deps.filter((dep) => allIds.has(dep))
+    const immutable = item.status === 'completed' || item.status === 'canceled'
+    nextItems[index] = {
+      ...item,
+      deps: filtered,
+      status: !immutable && item.status === 'pending' ? 'blocked' : item.status,
+      lastError: !immutable
+        ? `${item.lastError ? `${item.lastError}; ` : ''}Invalid deps: ${missing.join(', ')}`
+        : item.lastError,
+      updatedAt: now
+    }
+  }
+
+  const nextState: TodoState = {
+    ...state,
+    items: nextItems,
+    policy: { maxInProgress, maxSteps: state.policy?.maxSteps ?? parseTodoMaxSteps() },
+    updatedAt: now
+  }
+  return { nextState, errors }
+}
+
+const selectNextExecutableTodo = (state: TodoState) => {
+  const items = state.items
+  const byId = new Map(items.map((item) => [item.id, item] as const))
+  const isDone = (id: string) => byId.get(id)?.status === 'completed'
+  const candidates = items.filter((item) => item.status === 'pending')
+  const ready = candidates.filter((item) => (item.deps ?? []).every((dep) => isDone(dep)))
+  const priorityRank: Record<TodoPriority, number> = { high: 0, medium: 1, low: 2 }
+  ready.sort((a, b) => {
+    const pa = priorityRank[a.priority] ?? 1
+    const pb = priorityRank[b.priority] ?? 1
+    if (pa !== pb) return pa - pb
+    return a.createdAt - b.createdAt
+  })
+  return ready[0] ?? null
+}
+
+const runTodoMode = async (params: {
+  model: ModelConfig
+  message: string
+  contextBlock: string
+  systemText?: string
+  signal: AbortSignal | undefined
+  openAiThinkingExtras?: Record<string, unknown>
+  toolset: {
+    tools: OpenAiToolDefinition[]
+    toolMap: Map<string, { serverName: string; toolName: string; server: McpServerConfig }>
+    localToolMap: Map<string, LocalToolHandler>
+  }
+  threadId: string
+  send: (event: string, data: unknown) => void
+  onToolEvent?: (event: 'tool_start' | 'tool_end', data: Record<string, unknown>) => void
+  onUsage?: (usage: TokenUsage) => void
+}) => {
+  const {
+    model,
+    message,
+    contextBlock,
+    systemText,
+    signal,
+    openAiThinkingExtras,
+    toolset,
+    threadId,
+    send,
+    onToolEvent,
+    onUsage
+  } = params
+
+  const agents: Array<{ name: string; output: string }> = []
+  const tools: string[] = []
+  const toolContext: ToolExecutionContext = {
+    model,
+    systemText,
+    threadId,
+    openAiThinkingExtras,
+    toolset,
+    onToolEvent,
+    onUsage,
+    signal,
+    send,
+    subagentCallCount: 0,
+    maxSubagentCalls: 3
+  }
+
+  const getState = () => {
+    const current = getThread(threadId)?.todoState ?? null
+    return current ?? buildDefaultTodoState()
+  }
+
+  let state = getState()
+  updateThreadTodoState(threadId, state)
+  send('todo_state', { todoState: state })
+
+  const allowedToolNames = Array.from(
+    new Set(
+      (toolset.tools ?? [])
+        .map((tool: any) => tool?.function?.name)
+        .filter((name: unknown): name is string => typeof name === 'string' && name.trim().length > 0)
+    )
+  )
+  const plannerRolePrompt =
+    `You are Todo Planner. You must output ONLY a JSON object that matches this schema: {"ops":[{"op":"add","item":{"content":string,"priority":"high"|"medium"|"low","deps":string[],"toolHints":{"tool":string,"args":object}}}|{"op":"update","id":string,"patch":{"content"?:string,"status"?: "pending"|"in_progress"|"completed"|"blocked"|"canceled","priority"?: "high"|"medium"|"low","deps"?:string[],"lastError"?:string,"toolHints"?:{"tool"?:string,"args"?:object}}}|{"op":"cancel","id":string,"reason"?:string}]}.
+
+Constraints:
+- Each todo content MUST be a short, imperative task title (<= 32 chars). No long explanations.
+- toolHints.tool MUST be one of these available tools: ${allowedToolNames.join(', ') || '(none)'}
+- deps must reference existing todo IDs from the provided TodoState JSON only; do not use numeric placeholders like "0","1". If unsure, omit deps.`
+
+  const maxSteps = state.policy?.maxSteps ?? parseTodoMaxSteps()
+  for (let step = 0; step < maxSteps; step += 1) {
+    state = getState()
+    const hasPending = state.items.some((item) => item.status === 'pending')
+    const hasInProgress = state.items.some((item) => item.status === 'in_progress')
+    const hasBlocked = state.items.some((item) => item.status === 'blocked')
+    if (state.items.length > 0 && !hasPending && !hasInProgress && !hasBlocked) break
+
+    const plannerInput = `User Request:\n${message}\n\nContext:\n${contextBlock}\n\nCurrent TodoState JSON:\n${JSON.stringify(
+      state,
+      null,
+      2
+    )}\n\nReturn a JSON patch. If there are no todos, add 3-5 todos. If a todo is blocked, consider updating it or canceling it.`
+
+    const plannerStart = Date.now()
+    send('agent_start', { name: 'todo_planner' })
+    const plannerResult = await runAgentStep(
+      model,
+      plannerRolePrompt,
+      plannerInput,
+      signal,
+      systemText,
+      openAiThinkingExtras,
+      { agentName: 'todo_planner', threadId },
+      onUsage
+    )
+    send('agent_end', { name: 'todo_planner', durationMs: Date.now() - plannerStart })
+
+    const plannerText = plannerResult.content ?? ''
+    agents.push({ name: 'todo_planner', output: plannerText })
+    const jsonText = extractJsonObjectText(plannerText)
+    if (!jsonText) {
+      const id = randomUUID()
+      const updated = applyTodoPatch(state, { ops: [{ op: 'add', item: { content: `Planner JSON parse failed (${id})`, priority: 'high', deps: [], toolHints: { tool: 'task', args: { subagent_type: 'general-purpose', task: 'Fix planner JSON output.' } } } }] } as any)
+      state = updated.nextState
+      updateThreadTodoState(threadId, state)
+      send('todo_state', { todoState: state })
+      break
+    }
+
+    let patch: z.infer<typeof TodoPatchSchema>
+    try {
+      patch = TodoPatchSchema.parse(JSON.parse(jsonText))
+    } catch (error) {
+      const safe = error instanceof Error ? error.message : 'Invalid todo patch'
+      state = {
+        ...state,
+        items: state.items.map((item) =>
+          item.status === 'in_progress' ? { ...item, status: 'blocked', lastError: safe, updatedAt: Date.now() } : item
+        ),
+        updatedAt: Date.now()
+      }
+      updateThreadTodoState(threadId, state)
+      send('todo_state', { todoState: state })
+      break
+    }
+
+    const applied = applyTodoPatch(state, patch)
+    if (applied.errors.length > 0) {
+      state = {
+        ...state,
+        items: state.items.map((item) =>
+          item.status === 'in_progress'
+            ? { ...item, status: 'blocked', lastError: applied.errors.join('; '), updatedAt: Date.now() }
+            : item
+        ),
+        updatedAt: Date.now()
+      }
+      updateThreadTodoState(threadId, state)
+      send('todo_state', { todoState: state })
+      break
+    }
+
+    state = applied.nextState
+    updateThreadTodoState(threadId, state)
+    send('todo_patch', patch)
+    send('todo_state', { todoState: state })
+
+    state = getState()
+    const nextTodo = selectNextExecutableTodo(state)
+    if (!nextTodo) break
+
+    state = {
+      ...state,
+      items: state.items.map((item) => (item.id === nextTodo.id ? { ...item, status: 'in_progress', updatedAt: Date.now() } : item)),
+      updatedAt: Date.now()
+    }
+    updateThreadTodoState(threadId, state)
+    send('todo_state', { todoState: state })
+
+    const toolName = nextTodo.toolHints?.tool
+    const toolArgs = nextTodo.toolHints?.args ?? {}
+    if (!toolName) {
+      state = {
+        ...state,
+        items: state.items.map((item) =>
+          item.id === nextTodo.id
+            ? { ...item, status: 'blocked', lastError: 'Missing toolHints.tool', updatedAt: Date.now() }
+            : item
+        ),
+        updatedAt: Date.now()
+      }
+      updateThreadTodoState(threadId, state)
+      send('todo_state', { todoState: state })
+      continue
+    }
+
+    const toolAvailable = toolset.localToolMap.has(toolName) || toolset.toolMap.has(toolName)
+    if (!toolAvailable) {
+      state = {
+        ...state,
+        items: state.items.map((item) =>
+          item.id === nextTodo.id
+            ? { ...item, status: 'blocked', lastError: `Unknown tool: ${toolName}`, updatedAt: Date.now() }
+            : item
+        ),
+        updatedAt: Date.now()
+      }
+      updateThreadTodoState(threadId, state)
+      send('todo_state', { todoState: state })
+      continue
+    }
+
+    const executorStart = Date.now()
+    send('agent_start', { name: 'todo_executor' })
+    const { toolNames, hadError } = await executeMcpToolCalls(
+      [{ id: randomUUID(), name: toolName, arguments: toolArgs }],
+      { toolMap: toolset.toolMap, localToolMap: toolset.localToolMap },
+      onToolEvent,
+      { ...toolContext, currentAgentName: 'todo_executor' }
+    )
+    send('agent_end', { name: 'todo_executor', durationMs: Date.now() - executorStart })
+    tools.push(...toolNames)
+
+    state = {
+      ...state,
+      items: state.items.map((item) => {
+        if (item.id !== nextTodo.id) return item
+        if (!hadError) return { ...item, status: 'completed', lastError: undefined, updatedAt: Date.now() }
+        const existingError =
+          typeof item.lastError === 'string' && item.lastError.trim().length > 0 ? item.lastError : undefined
+        return {
+          ...item,
+          status: 'blocked',
+          lastError: existingError ?? `Tool execution failed: ${toolName}`,
+          updatedAt: Date.now()
+        }
+      }),
+      updatedAt: Date.now()
+    }
+    updateThreadTodoState(threadId, state)
+    send('todo_state', { todoState: state })
+  }
+
+  state = getState()
+  const reporterPrompt = REPORTER_PROMPT
+  const unfinished = state.items.filter((item) => item.status !== 'completed' && item.status !== 'canceled')
+  const unfinishedSummary = (() => {
+    if (unfinished.length === 0) return 'ALL_COMPLETED'
+    const counts = {
+      pending: unfinished.filter((i) => i.status === 'pending').length,
+      in_progress: unfinished.filter((i) => i.status === 'in_progress').length,
+      blocked: unfinished.filter((i) => i.status === 'blocked').length
+    }
+    const topBlocked = unfinished
+      .filter((i) => i.status === 'blocked')
+      .slice(0, 3)
+      .map((i) => `${i.content}: ${i.lastError ?? ''}`.trim())
+      .filter(Boolean)
+      .join(' | ')
+    return `UNFINISHED pending=${counts.pending} in_progress=${counts.in_progress} blocked=${counts.blocked} ${topBlocked ? `blocked_top=${topBlocked}` : ''}`.trim()
+  })()
+  const reporterInput = `User Request:\n${message}\n\nExecution Summary:\n${unfinishedSummary}\n\nFinal TodoState JSON:\n${JSON.stringify(
+    state,
+    null,
+    2
+  )}\n\nWrite the final answer. If unfinished is not ALL_COMPLETED, you MUST explicitly say the task is not fully completed, explain why (e.g. missing tools / blocked tasks / max steps), and list the remaining todos briefly.`
+  const reporterStart = Date.now()
+  send('agent_start', { name: 'todo_reporter' })
+  const reporter = await runAgentStep(
+    model,
+    reporterPrompt,
+    reporterInput,
+    signal,
+    systemText,
+    openAiThinkingExtras,
+    { agentName: 'todo_reporter', threadId },
+    onUsage
+  )
+  send('agent_end', { name: 'todo_reporter', durationMs: Date.now() - reporterStart })
+  agents.push({ name: 'todo_reporter', output: reporter.content ?? '' })
+
+  return { finalResponse: reporter.content ?? '', agents, tools, todoState: state }
 }
 
 const maybeBuildPlan = async (
@@ -3488,8 +3969,9 @@ chatRoute.post('/stream', async (c) => {
   const tokenUsage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 }
   const onUsage = (usage: TokenUsage) => mergeTokenUsage(tokenUsage, usage)
   const isFlash = body.mode === 'flash'
+  const todoEnabled = body.mode === 'todo'
   let autoSkill: SkillDefinition | null = null
-  if (!skillCommand && !isFlash && rawMessageWithoutCompact.trim().length > 0) {
+  if (!skillCommand && !isFlash && !todoEnabled && rawMessageWithoutCompact.trim().length > 0) {
     autoSkill = await maybeSelectSkill(rawMessageWithoutCompact, model, c.req.raw.signal, onUsage)
   }
 
@@ -3969,9 +4451,13 @@ chatRoute.post('/stream', async (c) => {
           const contextBlock = buildContextBlock(contextSlice)
           const { isPro, thinkingEnabled } = resolveModeFlags(body.mode)
           const ultraEnabled = body.mode === 'ultra'
-          const multiAgentEnabled = !isFlash && (Boolean(body.multiAgent) || Boolean(multiAgentCommand) || body.mode === 'ultra')
+          const multiAgentEnabled =
+            !todoEnabled && !isFlash && (Boolean(body.multiAgent) || Boolean(multiAgentCommand) || body.mode === 'ultra')
           const openAiThinkingExtras = thinkingEnabled ? getThinkingRequestExtras(model) : undefined
-          const mcpToolset = isFlash ? buildFlashToolset(threadData, thread.id) : await maybeLoadMcpToolset(model, threadData, thread.id)
+          const mcpToolset = isFlash
+            ? buildFlashToolset(threadData, thread.id)
+            : await maybeLoadMcpToolset(model, threadData, thread.id)
+          const effectiveToolset = (mcpToolset ?? buildFlashToolset(threadData, thread.id)) as any
 
           // 生成回复并流式发送
           let finalResponse = ''
@@ -4058,7 +4544,7 @@ chatRoute.post('/stream', async (c) => {
             systemText,
             threadId: thread.id,
             openAiThinkingExtras,
-            toolset: mcpToolset,
+            toolset: effectiveToolset,
             onToolEvent,
             onUsage,
             signal: c.req.raw.signal,
@@ -4112,6 +4598,23 @@ chatRoute.post('/stream', async (c) => {
             } else {
               throw new Error(`Unsupported model protocol: ${model.protocol}`)
             }
+          } else if (todoEnabled) {
+            const result = await runTodoMode({
+              model,
+              message,
+              contextBlock,
+              systemText,
+              signal: c.req.raw.signal,
+              openAiThinkingExtras,
+              toolset: effectiveToolset,
+              threadId: thread.id,
+              send,
+              onToolEvent,
+              onUsage
+            })
+            finalResponse = result.finalResponse
+            agents.push(...result.agents)
+            tools.push(...result.tools)
           } else if (multiAgentEnabled) {
             const onReasoning = (delta: string) => {
               if (!reasoningActive) {
@@ -4435,6 +4938,7 @@ chatRoute.post('/stream', async (c) => {
             content: finalResponse,
             meta: {
               thinking: thinkingSummary,
+              todoState: todoEnabled ? (getThread(thread.id)?.todoState ?? null) : undefined,
               skills:
                 (activeSkillId ? [activeSkillId] : []).concat(skillReads.map((item) => item.name)).filter(Boolean),
               skillReads: skillReads.length > 0 ? skillReads : undefined,
@@ -4510,8 +5014,9 @@ chatRoute.post('/', async (c) => {
     const tokenUsage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 }
     const onUsage = (usage: TokenUsage) => mergeTokenUsage(tokenUsage, usage)
     const isFlash = body.mode === 'flash'
+    const todoEnabled = body.mode === 'todo'
     let autoSkill: SkillDefinition | null = null
-    if (!skillCommand && !isFlash && rawMessageWithoutCompact.trim().length > 0) {
+    if (!skillCommand && !isFlash && !todoEnabled && rawMessageWithoutCompact.trim().length > 0) {
       autoSkill = await maybeSelectSkill(rawMessageWithoutCompact, model, c.req.raw.signal, onUsage)
     }
 
@@ -4600,10 +5105,13 @@ chatRoute.post('/', async (c) => {
     const contextBlock = buildContextBlock(contextSlice)
     const { isPro, thinkingEnabled } = resolveModeFlags(body.mode)
     const ultraEnabled = body.mode === 'ultra'
-    const multiAgentEnabled = !isFlash && (Boolean(body.multiAgent) || Boolean(multiAgentCommand) || ultraEnabled)
+    const multiAgentEnabled = !todoEnabled && !isFlash && (Boolean(body.multiAgent) || Boolean(multiAgentCommand) || ultraEnabled)
     const openAiThinkingExtras = thinkingEnabled ? getThinkingRequestExtras(model) : undefined
     const threadData = ensureThreadData(thread.id)
-    const mcpToolset = isFlash ? buildFlashToolset(threadData, thread.id) : await maybeLoadMcpToolset(model, threadData, thread.id)
+    const mcpToolset = isFlash
+      ? buildFlashToolset(threadData, thread.id)
+      : await maybeLoadMcpToolset(model, threadData, thread.id)
+    const effectiveToolset = (mcpToolset ?? buildFlashToolset(threadData, thread.id)) as any
 
     if (isFlash) {
       let response = ''
@@ -4620,11 +5128,11 @@ chatRoute.post('/', async (c) => {
           model,
           systemText,
           threadId: thread.id,
-          toolset: mcpToolset,
+          toolset: effectiveToolset,
           onUsage,
           signal: c.req.raw.signal
         }
-        const result = await callOpenAiWithMcp(openAiMessages as any, model, undefined, mcpToolset, toolContext)
+        const result = await callOpenAiWithMcp(openAiMessages as any, model, undefined, effectiveToolset, toolContext)
         response = result.content
         tools = result.tools ?? []
       } else if (model.protocol === 'anthropic') {
@@ -4636,7 +5144,7 @@ chatRoute.post('/', async (c) => {
           model,
           systemText,
           threadId: thread.id,
-          toolset: mcpToolset,
+          toolset: effectiveToolset,
           onUsage,
           signal: c.req.raw.signal
         }
@@ -4645,7 +5153,7 @@ chatRoute.post('/', async (c) => {
           systemText,
           model,
           undefined,
-          mcpToolset,
+          effectiveToolset,
           toolContext
         )
         response = result.content
@@ -4663,6 +5171,48 @@ chatRoute.post('/', async (c) => {
         meta: {
           skills: activeSkillId ? [activeSkillId] : [],
           tools: tools.length > 0 ? Array.from(new Set(tools)) : undefined,
+          artifacts: artifacts.length > 0 ? artifacts : undefined,
+          tokenUsage: tokenUsage.totalTokens > 0 ? tokenUsage : undefined
+        },
+        createdAt: Date.now()
+      })
+      const latestMeta = updated?.messages?.[updated.messages.length - 1]?.meta ?? null
+      return c.json({
+        response,
+        modelId: model.id,
+        threadId: thread.id,
+        messages: updated?.messages ?? [],
+        meta: latestMeta
+      })
+    }
+
+    if (todoEnabled) {
+      const result = await runTodoMode({
+        model,
+        message,
+        contextBlock,
+        systemText,
+        signal: c.req.raw.signal,
+        openAiThinkingExtras,
+        toolset: effectiveToolset,
+        threadId: thread.id,
+        send: () => {},
+        onToolEvent: undefined,
+        onUsage
+      })
+      const response = result.finalResponse
+      const artifacts = artifactCommand
+        ? [await saveTextArtifactForThread(thread.id, artifactCommand.fileName, response)]
+        : []
+      const updated = appendMessage(thread.id, {
+        id: randomUUID(),
+        role: 'assistant',
+        content: response,
+        meta: {
+          todoState: result.todoState,
+          skills: activeSkillId ? [activeSkillId] : [],
+          tools: result.tools.length > 0 ? Array.from(new Set(result.tools)) : undefined,
+          agents: result.agents.length > 0 ? result.agents : undefined,
           artifacts: artifacts.length > 0 ? artifacts : undefined,
           tokenUsage: tokenUsage.totalTokens > 0 ? tokenUsage : undefined
         },
@@ -5063,5 +5613,7 @@ export const __test__ = {
   getThinkingRequestExtras,
   normalizeSubagentType,
   buildFlashToolset: (threadId: string) => buildFlashToolset(ensureThreadData(threadId), threadId),
-  executeMcpToolCalls
+  executeMcpToolCalls,
+  buildDefaultTodoState,
+  applyTodoPatch
 }

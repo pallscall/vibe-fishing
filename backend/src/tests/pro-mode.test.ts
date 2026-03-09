@@ -1,7 +1,8 @@
 import { strict as assert } from 'node:assert'
 import { __test__ } from '../routes/chat'
 
-const { resolveModeFlags, getThinkingRequestExtras, normalizeSubagentType } = __test__
+const { resolveModeFlags, getThinkingRequestExtras, normalizeSubagentType, buildDefaultTodoState, applyTodoPatch } =
+  __test__
 
 const baseModel = {
   id: 'test',
@@ -42,6 +43,31 @@ assert.equal(pro.thinkingEnabled, true)
 const ultra = resolveModeFlags('ultra')
 assert.equal(ultra.isPro, true)
 assert.equal(ultra.thinkingEnabled, true)
+
+const todo = resolveModeFlags('todo')
+assert.equal(todo.isPro, false)
+assert.equal(todo.thinkingEnabled, true)
+
+{
+  const base = buildDefaultTodoState()
+  const { nextState, errors } = applyTodoPatch(base as any, {
+    ops: [
+      {
+        op: 'add',
+        item: {
+          content: 'do something',
+          priority: 'high',
+          deps: ['0'],
+          toolHints: { tool: 'web_search', args: { query: 'x' } }
+        }
+      }
+    ]
+  } as any)
+  assert.equal(errors.length, 0)
+  assert.equal(nextState.items.length, 1)
+  assert.equal(nextState.items[0].status, 'blocked')
+  assert.ok((nextState.items[0].lastError ?? '').includes('Invalid deps'))
+}
 
 assert.equal(getThinkingRequestExtras(noThinkingModel), undefined)
 assert.deepEqual(getThinkingRequestExtras(supportsThinkingModel), supportsThinkingModel.whenThinkingEnabled)

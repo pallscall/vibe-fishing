@@ -8,7 +8,7 @@ import { motion } from 'framer-motion';
 
 interface ChatMessageProps {
   message: Message;
-  mode?: 'flash' | 'thinking' | 'pro' | 'ultra' | 'vibefishing';
+  mode?: 'flash' | 'thinking' | 'pro' | 'ultra' | 'vibefishing' | 'todo';
 }
 
 const truncateText = (value: string, maxChars = 320) => {

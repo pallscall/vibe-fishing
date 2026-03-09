@@ -4,7 +4,8 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ChatList } from './ChatList';
 import { ChatInput } from './ChatInput';
 import { ToolTimelinePanel } from './ToolTimelinePanel';
-import { Message, ModelOption, ThreadState } from '@/lib/types';
+import { AgentTimelinePanel } from './AgentTimelinePanel';
+import { Message, ModelOption, ThreadState, TodoState } from '@/lib/types';
 import { v4 as uuidv4 } from 'uuid';
 import { Download, Eye, FileText, Folder, Globe, Loader2, Monitor, RefreshCcw, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
@@ -15,7 +16,7 @@ interface ChatProps {
   threadId: string | null;
 }
 
-type ChatMode = 'flash' | 'thinking' | 'pro' | 'ultra' | 'vibefishing';
+type ChatMode = 'flash' | 'thinking' | 'pro' | 'ultra' | 'vibefishing' | 'todo';
 type ToolTimelineItem = {
   callId?: string;
   name: string;
@@ -39,12 +40,111 @@ type FileNode =
   | { type: 'dir'; name: string; path: string; children: FileNode[] }
   | { type: 'file'; name: string; path: string; artifact: ArtifactItem };
 
+function TodoPanel({ todoState }: { todoState: TodoState | null }) {
+  const items = todoState?.items ?? [];
+  if (!todoState || items.length === 0) {
+    return (
+      <div className="rounded-2xl border border-zinc-200/70 dark:border-zinc-800/70 bg-white/80 dark:bg-zinc-950/70 p-4 text-xs text-zinc-500">
+        暂无 Todo
+      </div>
+    );
+  }
+
+  const labelStatus = (status: string) => {
+    if (status === 'pending') return '待办';
+    if (status === 'in_progress') return '进行中';
+    if (status === 'completed') return '已完成';
+    if (status === 'blocked') return '阻塞';
+    if (status === 'canceled') return '已取消';
+    return status;
+  };
+
+  const statusClass = (status: string) => {
+    if (status === 'in_progress') return 'bg-amber-500/10 text-amber-600 dark:text-amber-400';
+    if (status === 'completed') return 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400';
+    if (status === 'blocked') return 'bg-rose-500/10 text-rose-600 dark:text-rose-400';
+    if (status === 'canceled') return 'bg-zinc-500/10 text-zinc-500 dark:text-zinc-400';
+    return 'bg-zinc-500/10 text-zinc-600 dark:text-zinc-300';
+  };
+
+  return (
+    <div className="rounded-2xl border border-zinc-200/70 dark:border-zinc-800/70 bg-white/80 dark:bg-zinc-950/70 p-4">
+      <div className="flex items-center justify-between mb-3">
+        <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Todos</div>
+        <div className="text-[11px] text-zinc-400">Live</div>
+      </div>
+      <div className="space-y-2">
+        {items.map((item) => (
+          <div
+            key={item.id}
+            className="rounded-xl border border-zinc-200/70 dark:border-zinc-800/70 bg-white/70 dark:bg-zinc-950/60 px-3 py-2"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="min-w-0 text-xs font-semibold text-zinc-800 dark:text-zinc-100 truncate">
+                {item.content}
+              </div>
+              <span className={cn('shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold', statusClass(item.status))}>
+                {labelStatus(item.status)}
+              </span>
+            </div>
+            {item.lastError ? (
+              <div className="mt-1 text-[11px] text-rose-500 dark:text-rose-400 break-words">{item.lastError}</div>
+            ) : null}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function applyTodoPatchToState(prev: TodoState | null, patch: any): TodoState | null {
+  if (!prev) return prev;
+  const ops = Array.isArray(patch?.ops) ? patch.ops : null;
+  if (!ops) return prev;
+  const now = Date.now();
+  const next: TodoState = {
+    ...prev,
+    items: prev.items.map((item) => ({ ...item })),
+    updatedAt: now,
+  };
+  const replace = (id: string, updater: (item: any) => any) => {
+    const idx = next.items.findIndex((item) => item.id === id);
+    if (idx < 0) return;
+    next.items[idx] = { ...updater(next.items[idx]), updatedAt: now };
+  };
+  for (const op of ops) {
+    if (op?.op === 'add' && op.item && typeof op.item.content === 'string') {
+      const id = typeof op.item.id === 'string' ? op.item.id : `${now}-${Math.random().toString(16).slice(2)}`;
+      next.items.push({
+        id,
+        content: op.item.content,
+        status: 'pending',
+        priority: op.item.priority ?? 'medium',
+        deps: Array.isArray(op.item.deps) ? op.item.deps : [],
+        toolHints: op.item.toolHints,
+        createdAt: now,
+        updatedAt: now,
+      } as any);
+      continue;
+    }
+    if (op?.op === 'cancel' && typeof op.id === 'string') {
+      replace(op.id, (item) => ({ ...item, status: 'canceled', lastError: typeof op.reason === 'string' ? op.reason : item.lastError }));
+      continue;
+    }
+    if (op?.op === 'update' && typeof op.id === 'string' && op.patch && typeof op.patch === 'object') {
+      replace(op.id, (item) => ({ ...item, ...(op.patch as any) }));
+    }
+  }
+  return next;
+}
+
 const MODE_OPTIONS: Array<{ value: ChatMode; label: string; description: string }> = [
   { value: 'flash', label: 'Flash', description: '快速高效完成任务，但可能不够精准' },
   { value: 'thinking', label: 'Thinking', description: '先思考再行动，在速度与准确性之间取平衡' },
   { value: 'pro', label: 'Planner', description: '先规划再执行，获得更精准的结果，可能需要更多时间' },
   { value: 'ultra', label: 'Ultra', description: '继承自 Planner，可并行协作处理复杂任务，能力最强' },
   { value: 'vibefishing', label: 'Vibe Fishing', description: '规划 + 调研 + 执行协作，多代理协同模式' },
+  { value: 'todo', label: 'Todo', description: '结构化 Todo 状态机驱动执行，过程可追踪' },
 ];
 
 const MAX_INLINE_BYTES = 2 * 1024 * 1024;
@@ -90,6 +190,7 @@ export function Chat({ threadId }: ChatProps) {
     }>
   >([]);
   const [toolTimeline, setToolTimeline] = useState<ToolTimelineItem[]>([]);
+  const [todoState, setTodoState] = useState<TodoState | null>(null);
   const [agentPanelOpen, setAgentPanelOpen] = useState(false);
   const [selectedTimelineMessageId, setSelectedTimelineMessageId] = useState<string | null>(null);
   const [timelineAutoMode, setTimelineAutoMode] = useState(true);
@@ -97,6 +198,69 @@ export function Chat({ threadId }: ChatProps) {
   const abortRequestedRef = useRef(false);
   const MODE_STORAGE_KEY = 'vibe_fishing_mode';
   const MODEL_STORAGE_KEY = 'vibe_fishing_model';
+
+  //#region debug-point frontend-runtime-error-report
+  useEffect(() => {
+    const endpoint = 'http://127.0.0.1:7777/event';
+    const sessionId = 'vf-frontend';
+    const post = (payload: Record<string, unknown>) => {
+      try {
+        fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId, ...payload }),
+          keepalive: true,
+        }).catch(() => {});
+      } catch {
+      }
+    };
+
+    const onError = (event: ErrorEvent) => {
+      const error = (event as any)?.error as Error | undefined;
+      post({
+        type: 'window_error',
+        message: event.message,
+        filename: event.filename,
+        lineno: event.lineno,
+        colno: event.colno,
+        stack: error?.stack,
+        href: typeof window !== 'undefined' ? window.location.href : '',
+        userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
+      });
+    };
+
+    const onUnhandledRejection = (event: PromiseRejectionEvent) => {
+      const reason = (event as any)?.reason as any;
+      const message =
+        typeof reason?.message === 'string'
+          ? reason.message
+          : typeof reason === 'string'
+            ? reason
+            : (() => {
+                try {
+                  return JSON.stringify(reason);
+                } catch {
+                  return String(reason ?? '');
+                }
+              })();
+      post({
+        type: 'unhandledrejection',
+        message,
+        stack: typeof reason?.stack === 'string' ? reason.stack : undefined,
+        href: typeof window !== 'undefined' ? window.location.href : '',
+        userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
+      });
+    };
+
+    window.addEventListener('error', onError);
+    window.addEventListener('unhandledrejection', onUnhandledRejection);
+    post({ type: 'debug_ready', href: window.location.href });
+    return () => {
+      window.removeEventListener('error', onError);
+      window.removeEventListener('unhandledrejection', onUnhandledRejection);
+    };
+  }, []);
+  //#endregion debug-point frontend-runtime-error-report
 
   const API_BASE_URL = (process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:8000').replace(/\/+$/, '');
   const apiUrl = (pathname: string) => {
@@ -403,6 +567,20 @@ export function Chat({ threadId }: ChatProps) {
     if (!source) return [];
     return source.meta?.toolTimeline ?? [];
   }, [toolTimeline, selectedTimelineMessageId, timelineSourceMessage]);
+
+  const latestTodoState = useMemo(() => {
+    if (selectedTimelineMessageId === 'streaming' && todoState) return todoState;
+    const source = timelineSourceMessage;
+    if (!source) return null;
+    return (source.meta?.todoState ?? null) as TodoState | null;
+  }, [todoState, selectedTimelineMessageId, timelineSourceMessage]);
+
+  const latestAgentTimeline = useMemo(() => {
+    if (selectedTimelineMessageId === 'streaming' && agentTimeline.length > 0) return agentTimeline;
+    const source = timelineSourceMessage;
+    if (!source) return [];
+    return source.meta?.agentTimeline ?? [];
+  }, [agentTimeline, selectedTimelineMessageId, timelineSourceMessage]);
 
   const timelineOptions = useMemo(() => {
     const options: Array<{ value: string; label: string }> = [];
@@ -1004,6 +1182,28 @@ export function Chat({ threadId }: ChatProps) {
           setStreamingMessage((prev) => {
             if (!prev || prev.id !== streamingId) return prev;
             return { ...prev, meta: { ...(prev.meta ?? {}), trace } };
+          });
+          return;
+        }
+
+        if (event === 'todo_state') {
+          const nextTodoState = (data as any)?.todoState;
+          if (nextTodoState && typeof nextTodoState === 'object') {
+            setTodoState(nextTodoState as TodoState);
+            setStreamingMessage((prev) => {
+              if (!prev || prev.id !== streamingId) return prev;
+              return { ...prev, meta: { ...(prev.meta ?? {}), todoState: nextTodoState as TodoState } };
+            });
+          }
+          return;
+        }
+
+        if (event === 'todo_patch') {
+          setTodoState((prev) => applyTodoPatchToState(prev, data));
+          setStreamingMessage((prev) => {
+            if (!prev || prev.id !== streamingId) return prev;
+            const updated = applyTodoPatchToState((prev.meta?.todoState ?? null) as any, data);
+            return { ...prev, meta: { ...(prev.meta ?? {}), todoState: updated } };
           });
           return;
         }
@@ -1844,7 +2044,9 @@ export function Chat({ threadId }: ChatProps) {
               </div>
               <div className="flex-1 overflow-auto p-4">
                 <div className="space-y-4">
+                  <TodoPanel todoState={latestTodoState} />
                   <ToolTimelinePanel items={latestToolTimeline} />
+                  <AgentTimelinePanel items={latestAgentTimeline} />
                 </div>
               </div>
             </div>

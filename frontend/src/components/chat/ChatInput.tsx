@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
-import { SendHorizontal, Paperclip, ChevronDown, Zap, Brain, GraduationCap, Rocket, Layers, Square } from 'lucide-react';
+import { SendHorizontal, Paperclip, ChevronDown, Zap, Brain, GraduationCap, Rocket, Layers, ListChecks, Square } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { ModelOption } from '@/lib/types';
 
@@ -11,9 +11,13 @@ interface ChatInputProps {
   modelOptions: ModelOption[];
   selectedModelId: string;
   onModelChange: (id: string) => void;
-  mode: 'flash' | 'thinking' | 'pro' | 'ultra' | 'vibefishing';
-  modeOptions: Array<{ value: 'flash' | 'thinking' | 'pro' | 'ultra' | 'vibefishing'; label: string; description: string }>;
-  onModeChange: (mode: 'flash' | 'thinking' | 'pro' | 'ultra' | 'vibefishing') => void;
+  mode: 'flash' | 'thinking' | 'pro' | 'ultra' | 'vibefishing' | 'todo';
+  modeOptions: Array<{
+    value: 'flash' | 'thinking' | 'pro' | 'ultra' | 'vibefishing' | 'todo';
+    label: string;
+    description: string;
+  }>;
+  onModeChange: (mode: 'flash' | 'thinking' | 'pro' | 'ultra' | 'vibefishing' | 'todo') => void;
   selectedModeDescription: string;
   isModeDisabled?: boolean;
   isModelDisabled?: boolean;
@@ -34,7 +38,7 @@ export function ChatInput({
   isModelDisabled,
 }: ChatInputProps) {
   const [modeOpen, setModeOpen] = useState(false);
-  const handleModeSelect = (value: 'flash' | 'thinking' | 'pro' | 'ultra' | 'vibefishing') => {
+  const handleModeSelect = (value: 'flash' | 'thinking' | 'pro' | 'ultra' | 'vibefishing' | 'todo') => {
     onModeChange(value);
     setModeOpen(false);
   };
@@ -44,6 +48,7 @@ export function ChatInput({
     pro: <GraduationCap className="h-4 w-4" />,
     ultra: <Rocket className="h-4 w-4" />,
     vibefishing: <Layers className="h-4 w-4" />,
+    todo: <ListChecks className="h-4 w-4" />,
   };
   const activeMode = modeOptions.find((opt) => opt.value === mode);
   const [input, setInput] = useState('');
